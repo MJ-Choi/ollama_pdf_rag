@@ -1,10 +1,14 @@
 """RAG query service."""
+import json
+import logging
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from sqlalchemy.orm import Session
 from datetime import datetime
 
 from langchain_ollama import ChatOllama
 import ollama
+from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
@@ -17,6 +21,59 @@ from langchain_ollama import OllamaEmbeddings
 from ..database import PDFMetadata, ChatSession, ChatMessage
 from ..config import settings
 
+logger = logging.getLogger(__name__)
+
+# Below this many total chunks across the selected PDF(s), skip similarity
+# search entirely and feed the model the ENTIRE document instead. Retrieval
+# (MultiQueryRetriever, top-k) is a lossy approximation meant for large
+# corpora; for a small, deliberately-selected PDF (the common case here —
+# users pick specific PDFs to chat with) it can easily miss whole pages for
+# vague/exhaustive requests like "extract all the Chinese text", since
+# similarity search has no notion of "return everything". Full-document
+# mode sidesteps that class of bug for the sizes this app typically sees.
+FULL_CONTEXT_CHUNK_LIMIT = 40
+
+# Answer-generation output budget reserved on top of estimated input size
+# when sizing Ollama's num_ctx (context window). Without this, Ollama falls
+# back to its own default (often just 2048 tokens), which can silently
+# truncate context far below what the model actually supports.
+NUM_CTX_OUTPUT_BUDGET = 2048
+NUM_CTX_FLOOR = 4096
+NUM_CTX_CEILING = 32768
+
+
+def _estimate_num_ctx(*texts: str) -> int:
+    """Rough token-budget estimate for Ollama's num_ctx from prompt text length.
+
+    Uses a conservative ~2 chars/token estimate (safe for CJK-heavy text,
+    where 1 char is often ~1 token) plus a fixed output budget, clamped to
+    a sane floor/ceiling.
+    """
+    estimated_input_tokens = sum(len(t) for t in texts) // 2
+    return max(
+        NUM_CTX_FLOOR,
+        min(NUM_CTX_CEILING, estimated_input_tokens + NUM_CTX_OUTPUT_BUDGET),
+    )
+
+
+# Keywords signaling the user wants raw source text reproduced as-is
+# (line-by-line transcription/extraction), not a synthesized/summarized
+# answer. The default chain-of-thought prompt actively pushes the model to
+# "synthesize a comprehensive answer", which is wrong for these requests —
+# e.g. "extract the Chinese text" got turned into a summary glossary table
+# instead of the original lines.
+VERBATIM_INTENT_KEYWORDS = [
+    "그대로", "원문", "나열해", "줄 단위", "요약하지 말고", "요약 없이", "요약하지말고",
+    "verbatim", "raw text", "line by line", "line-by-line", "as-is", "word for word",
+    "그대로 추출", "그대로 번역",
+]
+
+
+def _wants_verbatim(question: str) -> bool:
+    """Detect requests for a verbatim line-by-line reproduction rather than a synthesized answer."""
+    lowered = question.lower()
+    return any(keyword.lower() in lowered for keyword in VERBATIM_INTENT_KEYWORDS)
+
 
 class RAGService:
     """Service for RAG operations."""
@@ -24,6 +81,60 @@ class RAGService:
     def __init__(self):
         """Initialize RAG service."""
         self.persist_directory = settings.VECTOR_DB_DIR
+        self.priority_context = self._load_priority_context()
+
+    def _load_priority_context(self) -> str:
+        """Load priority reference material from data/context/*.json.
+
+        `data/context/` holds any number of JSON files the user maintains
+        as authoritative reference material for RAG answers — term
+        glossaries (e.g. Chinese knitting-pattern terminology), style/rule
+        sheets, domain facts, etc. Every file in the directory is picked up
+        automatically and must be consulted BEFORE the model's own built-in
+        knowledge whenever it's relevant to the question.
+
+        Two shapes are supported per file:
+        - A flat string-to-string dict (e.g. {"下针": "K (겉뜨기)"}) is
+          rendered as a "term → value" lookup list.
+        - Anything else (nested objects, lists, etc.) is pretty-printed
+          as-is under a heading with the filename.
+
+        Returns a formatted prompt section, or "" if no context files exist.
+        """
+        context_dir = Path(settings.PROJECT_ROOT) / settings.CONTEXT_DIR
+        if not context_dir.is_dir():
+            return ""
+
+        sections = []
+        for json_path in sorted(context_dir.glob("*.json")):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to load context file {json_path}: {e}")
+                continue
+
+            if not data:
+                continue
+
+            if isinstance(data, dict) and all(isinstance(v, str) for v in data.values()):
+                body = "\n".join(f"- {key} → {value}" for key, value in data.items())
+            else:
+                body = json.dumps(data, ensure_ascii=False, indent=2)
+
+            sections.append(f"[{json_path.name}]\n{body}")
+
+        if not sections:
+            return ""
+
+        return (
+            "PRIORITY REFERENCE CONTEXT (from data/context/). Treat this as authoritative "
+            "and consult it FIRST whenever it's relevant to the question — prefer it over "
+            "your own built-in knowledge or assumptions (e.g. use these exact terms/values "
+            "instead of your own translation or recollection):\n\n"
+            + "\n\n".join(sections)
+            + "\n\n"
+        )
 
     def query_multi_pdf(
         self,
@@ -56,69 +167,135 @@ class RAGService:
 
         reasoning_steps.append(f"📚 Searching across {len(pdfs)} PDF(s): {', '.join([p.name for p in pdfs])}")
 
-        # Initialize LLM
+        # Initialize LLM (used for query-generation only; the final answer
+        # call gets its own instance sized to the actual context below)
         llm = ChatOllama(model=model)
         reasoning_steps.append(f"🤖 Using model: {model}")
 
-        # Query prompt for multi-query retriever
-        QUERY_PROMPT = PromptTemplate(
-            input_variables=["question"],
-            template="""You are an AI language model assistant. Your task is to generate 2
-            different versions of the given user question to retrieve relevant documents from
-            a vector database. By generating multiple perspectives on the user question, your
-            goal is to help the user overcome some of the limitations of the distance-based
-            similarity search. Provide these alternative questions separated by newlines.
-            Original question: {question}"""
-        )
+        # Small, deliberately-selected PDF set → skip similarity search and
+        # use the whole document(s) as context. See FULL_CONTEXT_CHUNK_LIMIT.
+        total_chunks = sum(pdf.doc_count for pdf in pdfs)
+        use_full_context = total_chunks <= FULL_CONTEXT_CHUNK_LIMIT
 
-        reasoning_steps.append("🔍 Generating alternative search queries...")
-
-        # Retrieve from all collections
-        all_docs = []
         embeddings = OllamaEmbeddings(model="nomic-embed-text")
+        all_docs = []
 
-        for pdf in pdfs:
-            vector_db = Chroma(
-                persist_directory=self.persist_directory,
-                embedding_function=embeddings,
-                collection_name=pdf.collection_name
+        if use_full_context:
+            reasoning_steps.append(
+                f"📖 {total_chunks} total chunk(s) across selected PDF(s) — using full-document context "
+                f"(no similarity search, so nothing gets missed)"
             )
 
-            retriever = MultiQueryRetriever.from_llm(
-                vector_db.as_retriever(search_kwargs={"k": 3}),
-                llm,
-                prompt=QUERY_PROMPT
+            for pdf in pdfs:
+                vector_db = Chroma(
+                    persist_directory=self.persist_directory,
+                    embedding_function=embeddings,
+                    collection_name=pdf.collection_name
+                )
+                try:
+                    reasoning_steps.append(f"📄 Loading full document: {pdf.name}")
+                    raw = vector_db.get(include=["documents", "metadatas"])
+                    docs = [
+                        Document(page_content=text, metadata=meta or {})
+                        for text, meta in zip(raw["documents"], raw["metadatas"])
+                    ]
+                    for doc in docs:
+                        doc.metadata.setdefault("pdf_name", pdf.name)
+                        doc.metadata.setdefault("pdf_id", pdf.pdf_id)
+                    # Preserve original page/chunk order for a coherent read
+                    docs.sort(
+                        key=lambda d: (
+                            d.metadata.get("source_page", d.metadata.get("chunk_index", 0)),
+                            d.metadata.get("chunk_index", 0),
+                        )
+                    )
+                    all_docs.extend(docs)
+                    reasoning_steps.append(f"✅ Loaded {len(docs)} chunk(s) from {pdf.name}")
+                except Exception as e:
+                    reasoning_steps.append(f"⚠️ Error loading {pdf.name}: {str(e)}")
+                    print(f"Error loading {pdf.name}: {e}")
+        else:
+            # Query prompt for multi-query retriever
+            QUERY_PROMPT = PromptTemplate(
+                input_variables=["question"],
+                template="""You are an AI language model assistant. Your task is to generate 2
+                different versions of the given user question to retrieve relevant documents from
+                a vector database. By generating multiple perspectives on the user question, your
+                goal is to help the user overcome some of the limitations of the distance-based
+                similarity search. Provide these alternative questions separated by newlines.
+                Original question: {question}"""
             )
 
-            try:
-                reasoning_steps.append(f"📄 Retrieving from: {pdf.name}")
-                # Use invoke instead of deprecated get_relevant_documents
-                docs = retriever.invoke(question)
-                # Ensure metadata is present
-                for doc in docs:
-                    if "pdf_name" not in doc.metadata:
-                        doc.metadata["pdf_name"] = pdf.name
-                    if "pdf_id" not in doc.metadata:
-                        doc.metadata["pdf_id"] = pdf.pdf_id
-                all_docs.extend(docs)
-                reasoning_steps.append(f"✅ Found {len(docs)} relevant chunks in {pdf.name}")
-            except Exception as e:
-                reasoning_steps.append(f"⚠️ Error retrieving from {pdf.name}: {str(e)}")
-                print(f"Error retrieving from {pdf.name}: {e}")
+            reasoning_steps.append("🔍 Generating alternative search queries...")
+
+            for pdf in pdfs:
+                vector_db = Chroma(
+                    persist_directory=self.persist_directory,
+                    embedding_function=embeddings,
+                    collection_name=pdf.collection_name
+                )
+
+                retriever = MultiQueryRetriever.from_llm(
+                    vector_db.as_retriever(search_kwargs={"k": 3}),
+                    llm,
+                    prompt=QUERY_PROMPT
+                )
+
+                try:
+                    reasoning_steps.append(f"📄 Retrieving from: {pdf.name}")
+                    # Use invoke instead of deprecated get_relevant_documents
+                    docs = retriever.invoke(question)
+                    # Ensure metadata is present
+                    for doc in docs:
+                        if "pdf_name" not in doc.metadata:
+                            doc.metadata["pdf_name"] = pdf.name
+                        if "pdf_id" not in doc.metadata:
+                            doc.metadata["pdf_id"] = pdf.pdf_id
+                    all_docs.extend(docs)
+                    reasoning_steps.append(f"✅ Found {len(docs)} relevant chunks in {pdf.name}")
+                except Exception as e:
+                    reasoning_steps.append(f"⚠️ Error retrieving from {pdf.name}: {str(e)}")
+                    print(f"Error retrieving from {pdf.name}: {e}")
 
         reasoning_steps.append(f"📊 Total chunks retrieved: {len(all_docs)}")
 
+        # In full-document mode, use every chunk; otherwise keep the
+        # existing top-10 cap for retrieval-based (large corpus) mode.
+        context_limit = len(all_docs) if use_full_context else 10
+
         # Format context with source labels
         context_parts = []
-        for doc in all_docs[:10]:
+        for doc in all_docs[:context_limit]:
             source = doc.metadata.get("pdf_name", "Unknown")
             context_parts.append(f"[Source: {source}]\n{doc.page_content}\n")
 
         formatted_context = "\n---\n".join(context_parts)
-        reasoning_steps.append(f"🔗 Using top {min(len(all_docs), 10)} chunks for context")
+        reasoning_steps.append(f"🔗 Using {min(len(all_docs), context_limit)} chunk(s) for context")
 
-        # RAG prompt template with chain-of-thought
-        template = """Answer the question based ONLY on the following context from multiple PDF documents.
+        verbatim_mode = _wants_verbatim(question)
+        reasoning_steps.append(
+            f"📝 Answer mode: {'verbatim line-by-line reproduction' if verbatim_mode else 'synthesized answer'}"
+        )
+
+        if verbatim_mode:
+            # Reproduce source lines as-is — explicitly forbid summarizing,
+            # paraphrasing, or reorganizing into tables.
+            template = """{priority_context}Reproduce the source text below EXACTLY as it appears, line by line, in its original order.
+        Do NOT summarize, paraphrase, synthesize into a table, deduplicate, or reorganize by topic.
+        Keep every line separate, in the same sequence as the context. If a translation is requested,
+        place the translation immediately after each original line (still one line at a time) — never
+        merge multiple lines into a single summarized statement.
+        Only insert a source label (e.g. [Source: filename]) when switching between different source documents.
+
+        Context:
+        {context}
+
+        Question: {question}
+
+        Output the content line by line, in original order, exactly as written in the context:"""
+        else:
+            # RAG prompt template with chain-of-thought
+            template = """{priority_context}Answer the question based ONLY on the following context from multiple PDF documents.
         Each section is marked with its source document.
 
         Use chain-of-thought reasoning:
@@ -136,11 +313,22 @@ class RAGService:
 
         Think step-by-step and provide your answer with source citations:"""
 
+        # Size the answer-generation model's context window to what we're
+        # actually sending it, instead of relying on Ollama's default
+        # (often 2048 tokens) which can silently truncate long contexts.
+        num_ctx = _estimate_num_ctx(template, formatted_context, self.priority_context, question)
+        reasoning_steps.append(f"🧮 Sizing model context window: num_ctx={num_ctx}")
+        answer_llm = ChatOllama(model=model, num_ctx=num_ctx)
+
         prompt = ChatPromptTemplate.from_template(template)
         chain = (
-            {"context": lambda x: formatted_context, "question": lambda x: x}
+            {
+                "context": lambda x: formatted_context,
+                "question": lambda x: x,
+                "priority_context": lambda x: self.priority_context,
+            }
             | prompt
-            | llm
+            | answer_llm
             | StrOutputParser()
         )
 
@@ -154,9 +342,25 @@ class RAGService:
             reasoning_steps.append("🧠 Using thinking-enabled model with chain-of-thought reasoning...")
             try:
                 # Enhanced system message for chain-of-thought reasoning
-                cot_system_message = f"""You are an expert AI assistant that uses chain-of-thought reasoning.
+                if verbatim_mode:
+                    cot_system_message = f"""You are an expert AI assistant reproducing source text exactly as written.
 
-Answer the question based ONLY on the provided context from PDF documents.
+{self.priority_context}Reproduce the source text below EXACTLY as it appears, line by line, in its original
+order. Do NOT summarize, paraphrase, synthesize into a table, deduplicate, or reorganize by topic.
+Keep every line separate, in the same sequence as the context. If a translation is requested, place
+the translation immediately after each original line (still one line at a time) — never merge
+multiple lines into a single summarized statement. Only insert a source label (e.g. [Source: filename])
+when switching between different source documents.
+
+Context from PDF documents:
+{formatted_context}
+
+Think about the correct line order and any requested translation, then output the content line by
+line, in original order, exactly as written in the context."""
+                else:
+                    cot_system_message = f"""You are an expert AI assistant that uses chain-of-thought reasoning.
+
+{self.priority_context}Answer the question based ONLY on the provided context from PDF documents.
 
 CHAIN-OF-THOUGHT PROCESS:
 1. **Read and understand** the question carefully
@@ -179,7 +383,8 @@ Think through each step carefully, showing your reasoning process."""
                         {"role": "user", "content": f"Question: {question}\n\nThink step-by-step and provide a detailed answer with source citations."}
                     ],
                     think=True,
-                    stream=False
+                    stream=False,
+                    options={"num_ctx": num_ctx}
                 )
 
                 # Add thinking process to reasoning steps
@@ -202,7 +407,7 @@ Think through each step carefully, showing your reasoning process."""
                 "pdf_id": doc.metadata.get("pdf_id"),
                 "chunk_index": doc.metadata.get("chunk_index", 0)
             }
-            for doc in all_docs[:10]
+            for doc in all_docs[:context_limit]
         ]
 
         reasoning_steps.append("✨ Answer generated successfully!")

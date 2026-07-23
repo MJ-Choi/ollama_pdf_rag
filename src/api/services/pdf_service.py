@@ -48,9 +48,20 @@ class PDFService:
             content = await file.read()
             f.write(content)
 
-        # Process PDF
-        documents = self.doc_processor.load_pdf(file_path)
-        chunks = self.doc_processor.split_documents(documents)
+        # Process PDF (falls back to OCR internally for scanned/image-based PDFs)
+        documents, used_ocr = self.doc_processor.load_pdf(file_path)
+        if used_ocr:
+            # OCR path already returns page-chunked documents; skip re-chunking.
+            chunks = documents
+            page_numbers = {
+                chunk.metadata.get("source_page")
+                for chunk in chunks
+                if chunk.metadata.get("source_page") is not None
+            }
+            page_count = len(page_numbers) if page_numbers else len(chunks)
+        else:
+            chunks = self.doc_processor.split_documents(documents)
+            page_count = len(documents)
 
         # Add metadata to chunks
         for i, chunk in enumerate(chunks):
@@ -75,7 +86,7 @@ class PDFService:
             collection_name=collection_name,
             upload_timestamp=datetime.now(),
             doc_count=len(chunks),
-            page_count=len(documents),
+            page_count=page_count,
             is_sample=False,
             file_path=str(file_path)
         )

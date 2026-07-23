@@ -16,6 +16,10 @@ protobuf>=5.29.5
 chromadb>=0.4.22
 Pillow==10.4.0
 numpy==1.26.4
+pytesseract>=0.3.13
+pdf2image>=1.17.0
+opencv-python-headless>=4.11.0
+langdetect>=1.0.9
 pytest>=8.2,<9
 pytest-cov==4.1.0
 coverage==7.4.0

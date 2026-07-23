@@ -3,10 +3,12 @@ import { getDefaultChatModel } from "@/lib/ai/models";
 import { createUIMessageStream, createUIMessageStreamResponse } from "ai";
 import { auth } from "@/app/(auth)/auth";
 import {
+  deleteChatById,
   getChatById,
   saveChat,
   saveMessages,
 } from "@/lib/db/queries";
+import { ChatSDKError } from "@/lib/errors";
 import { generateUUID } from "@/lib/utils";
 
 export const maxDuration = 60;
@@ -314,4 +316,36 @@ It looks like your question might be about a document, but you haven't selected 
 
     return createUIMessageStreamResponse({ stream: errorStream });
   }
+}
+
+export async function DELETE(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const id = searchParams.get("id");
+
+  if (!id) {
+    return new ChatSDKError(
+      "bad_request:api",
+      "Parameter id is required."
+    ).toResponse();
+  }
+
+  const session = await auth();
+
+  if (!session?.user?.id) {
+    return new ChatSDKError("unauthorized:chat").toResponse();
+  }
+
+  const chat = await getChatById({ id });
+
+  if (!chat) {
+    return new ChatSDKError("not_found:chat").toResponse();
+  }
+
+  if (chat.userId !== session.user.id) {
+    return new ChatSDKError("forbidden:chat").toResponse();
+  }
+
+  const deletedChat = await deleteChatById({ id });
+
+  return Response.json(deletedChat, { status: 200 });
 }

@@ -1,5 +1,5 @@
 echo "Check current chat.db"
-sqlite3 web-ui/data/chat.db ".tables"
+sqlite3 data/chat.db ".tables"
 
 echo "Delete chat.db"
 rm -f data/chat.db

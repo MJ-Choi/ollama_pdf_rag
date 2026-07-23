@@ -13,6 +13,8 @@ A powerful local RAG (Retrieval Augmented Generation) application that lets you 
 - 🖥️ **Two Modern UIs** - Next.js (primary) and Streamlit interfaces
 - 🔌 **REST API** - FastAPI backend for programmatic access
 - 📓 **Jupyter Notebooks** - For experimentation and learning
+- 🖼️ **Scanned PDF OCR** - Automatic OCR fallback with watermark removal for image-based/scanned PDFs (Chinese/Korean/English)
+- 📚 **Priority Reference Context** - Drop glossaries, rules, or domain facts as JSON into `data/context/` and the model consults them before its own knowledge
 
 ## 🖼️ Screenshots
 
@@ -41,7 +43,10 @@ ollama_pdf_rag/
 │   │   ├── components/       # UI components
 │   │   └── main.py           # Streamlit entry point
 │   └── core/                 # Core RAG functionality
-│       ├── document.py       # PDF processing
+│       ├── document.py       # PDF processing + scanned-PDF/OCR fallback detection
+│       ├── text_extractor.py # OCR extraction for scanned PDFs (pytesseract + pdf2image)
+│       ├── image_handler.py  # Image preprocessing & watermark removal (OpenCV)
+│       ├── image_analysis.py # OCR wrapper & image quality analysis
 │       ├── embeddings.py     # Vector embeddings
 │       ├── llm.py            # LLM configuration
 │       └── rag.py            # RAG pipeline
@@ -51,7 +56,8 @@ ollama_pdf_rag/
 │   └── lib/                  # Utilities & AI integration
 ├── data/
 │   ├── pdfs/                 # PDF storage
-│   └── vectors/              # ChromaDB storage
+│   ├── vectors/              # ChromaDB storage
+│   └── context/              # Priority reference context for the model (*.json: glossaries, rules, facts, ...)
 ├── notebooks/                # Jupyter notebooks
 ├── tests/                    # Unit tests
 ├── docs/                     # Documentation
@@ -68,7 +74,7 @@ ollama_pdf_rag/
    - Visit [Ollama's website](https://ollama.ai) to download and install
    - Pull required models:
      ```bash
-     ollama pull llama3.2  # or your preferred chat model
+     ollama pull {MODEL}  # or your preferred chat model
      ollama pull nomic-embed-text  # for embeddings
      ```
 
@@ -89,7 +95,8 @@ ollama_pdf_rag/
    ```bash
    cd web-ui
    pnpm install
-   pnpm db:migrate
+   pnpm db:migrate # If you need to reset the DB from scratch, run ./init-db.sh (⚠️ deletes data/chat.db and lib/db/migrations)
+   mv .env.example .env.local # set up env. You can make this file.
    cd ..
    ```
 

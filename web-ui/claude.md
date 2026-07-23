@@ -27,11 +27,11 @@ pnpm db:studio        # Drizzle Studio GUI
 pnpm db:push          # push schema changes directly (no migration file)
 ```
 
-For DB migration/build commands, see **Known Constraints** in the root `.claude/CLAUDE.md` — `pnpm db:migrate` and `pnpm build` are currently broken on a clean SQLite DB; use `npx tsx lib/db/init-db.ts` or the `/reset-webui-db` skill instead.
+`pnpm db:migrate` (and `pnpm build`, which runs it first) now work on a clean/empty SQLite DB. `npx tsx lib/db/init-db.ts` remains a valid alternative for local dev.
 
 ## Known Issues / Template Leftovers
 
-- `lib/db/migrations/meta/*_snapshot.json` and `_journal.json` declare `"dialect": "postgresql"` even though `drizzle.config.ts` and the actual runtime DB (`better-sqlite3`) are SQLite — this mismatch is the root cause of the broken `db:migrate`.
+- `lib/db/migrations/` was squashed to a single `0000_high_namora.sql` with `"dialect": "sqlite"` in `meta/_journal.json`, matching `drizzle.config.ts` and the runtime DB (`better-sqlite3`). This fixed an earlier `dialect: "postgresql"` mismatch that used to break `db:migrate` on a clean DB — `pnpm db:migrate` and `pnpm build` now work from empty.
 - `.env.example` still lists Vercel-specific vars (`AI_GATEWAY_API_KEY`, `BLOB_READ_WRITE_TOKEN`, `POSTGRES_URL`, `REDIS_URL`) from the upstream template; only a subset is actually required for local dev against the FastAPI backend (`NEXT_PUBLIC_API_URL`, `AUTH_SECRET`, DB path).
-- `lib/api/` (client code for the in-progress `/api/v1/analyze/*` OCR/translation feature) is currently an empty directory — see root CLAUDE.md's "Recent Changes & Branch Context" for the unfinished `feature/image` work.
+- `lib/api/` (client code for an in-progress `/api/v1/analyze/*` OCR/translation feature) is currently an empty directory — unfinished `feature/image` work, no backend route for it yet.
 - `.cursor/rules/ultracite.mdc` — Ultracite/Biome lint rules apply here; prefer `pnpm lint` / `pnpm format` over introducing ESLint config.
