@@ -7,6 +7,7 @@ Features:
 """
 import logging
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -45,6 +46,102 @@ _CJK_SPACING_RE = re.compile(
 
 def _collapse_cjk_spacing(text: str) -> str:
     return _CJK_SPACING_RE.sub('', text)
+
+
+# A running watermark/caption shows up, OCR noise and all,
+# as one of the first few lines
+# of nearly every page in a scanned pattern. Only the LEADING lines of each
+# page are considered as candidates — never anything mid-page — specifically
+# so real pattern content that legitimately repeats short instructions across
+# pages (e.g. "全下针") is never at risk of being stripped.
+_WATERMARK_HEADER_LINES_TO_CHECK = 3
+_WATERMARK_LINE_MIN_LENGTH = 12
+_WATERMARK_SIMILARITY_THRESHOLD = 0.65
+_WATERMARK_PAGE_COVERAGE = 0.6
+
+# OCR pads watermark lines with inconsistent junk at the edges (stray "|",
+# "~", digit fragments from a misread logo, extra spacing) that dilutes a
+# straight SequenceMatcher ratio enough to split what's really one recurring
+# line into several near-miss clusters. Trimming down to the first/last
+# letter-like (Latin/CJK/Hangul) character before comparing removes that
+# noise while leaving the actual text - including any internal
+# punctuation/digits - untouched.
+_LETTER_LIKE_RE = re.compile(r'[A-Za-z一-鿿㐀-䶿가-힣]')
+
+
+def _normalize_watermark_candidate(line: str) -> str:
+    stripped = line.strip()
+    matches = list(_LETTER_LIKE_RE.finditer(stripped))
+    if not matches:
+        return stripped
+    return stripped[matches[0].start():matches[-1].end()]
+
+
+def _strip_recurring_watermark_lines(pages: List[Dict]) -> None:
+    """Remove a repeated watermark/caption header that OCR picks up at the
+    top of most/all pages. Mutates each page dict's "text" in place.
+
+    Only the first `_WATERMARK_HEADER_LINES_TO_CHECK` non-empty lines of
+    each page are ever considered (pooled together, not tied to a fixed line
+    index — OCR inconsistently drops one part of a multi-line watermark on
+    some pages, which shifts where the surviving part lands), and only lines
+    that (fuzzy-)match across at least `_WATERMARK_PAGE_COVERAGE` of all
+    pages are removed. Needs at least 3 pages to distinguish "recurring"
+    from coincidence.
+    """
+    if len(pages) < 3:
+        return
+
+    # Pool candidates from the first few non-empty lines of every page —
+    # position bounds which lines are eligible, but doesn't pin the watermark
+    # to one exact index, since it can land on line 1 or line 2 depending on
+    # whether OCR also picked up the other watermark line on that page.
+    candidates: List[tuple] = [
+        (page_idx, line)
+        for page_idx, page in enumerate(pages)
+        for line in [ln for ln in page["text"].splitlines() if ln.strip()][:_WATERMARK_HEADER_LINES_TO_CHECK]
+        if len(line.strip()) >= _WATERMARK_LINE_MIN_LENGTH
+    ]
+
+    min_pages = max(2, round(len(pages) * _WATERMARK_PAGE_COVERAGE))
+    lines_to_remove_by_page: Dict[int, set] = {}
+
+    # Greedily cluster candidates by fuzzy similarity, tolerant of OCR noise.
+    #  A new candidate joins a cluster if it's similar enough to ANY member
+    # already in it (not just the cluster's first-seen representative)
+    # — a straight chain of drifting OCR variants can have
+    # a low first-to-last similarity while each
+    # neighboring pair is well within threshold.
+    clusters: List[Dict] = []
+    for page_idx, line in candidates:
+        normalized = _normalize_watermark_candidate(line)
+        cluster = next(
+            (c for c in clusters
+             if any(SequenceMatcher(None, member, normalized).ratio() >= _WATERMARK_SIMILARITY_THRESHOLD
+                    for member in c["normalized_members"])),
+            None,
+        )
+        if cluster is None:
+            cluster = {"normalized_members": [], "pages": set(), "lines": []}
+            clusters.append(cluster)
+        cluster["normalized_members"].append(normalized)
+        cluster["pages"].add(page_idx)
+        cluster["lines"].append((page_idx, line))
+
+    for cluster in clusters:
+        if len(cluster["pages"]) >= min_pages:
+            for page_idx, line in cluster["lines"]:
+                lines_to_remove_by_page.setdefault(page_idx, set()).add(line)
+
+    if not lines_to_remove_by_page:
+        return
+
+    for page_idx, page in enumerate(pages):
+        to_remove = lines_to_remove_by_page.get(page_idx)
+        if not to_remove:
+            continue
+        kept = [ln for ln in page["text"].splitlines() if ln not in to_remove]
+        page["text"] = "\n".join(kept)
 
 
 class TextExtractor:
@@ -113,6 +210,8 @@ class TextExtractor:
                 "language": language,
                 "confidence": confidence,
             })
+
+        _strip_recurring_watermark_lines(pages)
 
         average_blur_variance = sum(blur_variances) / len(blur_variances) if blur_variances else 0.0
         average_confidence = sum(confidences) / len(confidences) if confidences else 0.0

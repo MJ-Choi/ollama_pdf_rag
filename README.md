@@ -13,7 +13,8 @@ A powerful local RAG (Retrieval Augmented Generation) application that lets you 
 - 🖥️ **Two Modern UIs** - Next.js (primary) and Streamlit interfaces
 - 🔌 **REST API** - FastAPI backend for programmatic access
 - 📓 **Jupyter Notebooks** - For experimentation and learning
-- 🖼️ **Scanned PDF OCR** - Automatic OCR fallback with watermark removal for image-based/scanned PDFs (Chinese/Korean/English)
+- 🖼️ **Scanned PDF OCR** - Automatic OCR fallback with watermark removal (image-level *and* recurring text-caption removal) for image-based/scanned PDFs (Chinese/Korean/English)
+- 🌐 **Full-Document Translation** - Ask to translate a whole scanned document (e.g. "이 중국어 도안을 한국어로 번역해줘") and get a complete, line-by-line translation — page-by-page generation with automatic retry/continuation means it won't silently cut off partway through
 - 📚 **Priority Reference Context** - Drop glossaries, rules, or domain facts as JSON into `data/context/` and the model consults them before its own knowledge
 
 ## 🖼️ Screenshots
@@ -207,6 +208,9 @@ Install [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us
 #### CPU-Only Systems
 Reduce chunk size if experiencing memory issues:
 - Modify `chunk_size` to 500-1000 in `src/core/document.py`
+
+#### Full-document translation: occasional per-page warnings
+On a full multi-page translation, `reasoning_steps` may show a page retrying with "형식 검증 실패 (응답이 중복 생성됨)" and still ending in "형식 문제 남음" — this means that one page had a line the model couldn't usefully translate (e.g. OCR noise from a graphic/logo) and repeated it instead; the page's real content is kept and unaffected. Known, not yet fixed: on some documents the last page occasionally comes back in English instead of the requested target language.
 
 ## 🤝 Contributing
 

@@ -1,6 +1,8 @@
 """RAG query service."""
 import json
 import logging
+import re
+import time
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from sqlalchemy.orm import Session
@@ -10,7 +12,7 @@ from langchain_ollama import ChatOllama
 import ollama
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 try:
     from langchain_chroma import Chroma
@@ -42,18 +44,36 @@ NUM_CTX_OUTPUT_BUDGET = 2048
 NUM_CTX_FLOOR = 4096
 NUM_CTX_CEILING = 32768
 
+# Per-page budget used by _translate_pages (see below) — generous because a
+# single page's content is small, so this is cheap even at 2x the default.
+PAGE_TRANSLATION_OUTPUT_BUDGET = 4096
 
-def _estimate_num_ctx(*texts: str) -> int:
+# Extra attempts (beyond the first) to let a model continue a response that
+# Ollama's done_reason says was cut off before reaching a natural stop.
+# Bounds worst-case latency instead of looping indefinitely.
+MAX_CONTINUATION_ATTEMPTS = 2
+
+# Extra attempts (beyond the first) for a single page in _translate_pages
+# after a HARD failure (e.g. a mid-generation Ollama crash — "unexpected
+# EOF" — observed to leave Ollama's own server in a state that recovers a
+# few seconds later). Distinct from MAX_CONTINUATION_ATTEMPTS, which handles
+# a *successful* call that was merely cut off by num_ctx.
+MAX_PAGE_RETRY_ATTEMPTS = 2
+PAGE_RETRY_BACKOFF_SECONDS = 2
+
+
+def _estimate_num_ctx(*texts: str, output_budget: int = NUM_CTX_OUTPUT_BUDGET) -> int:
     """Rough token-budget estimate for Ollama's num_ctx from prompt text length.
 
     Uses a conservative ~2 chars/token estimate (safe for CJK-heavy text,
-    where 1 char is often ~1 token) plus a fixed output budget, clamped to
-    a sane floor/ceiling.
+    where 1 char is often ~1 token) plus an output budget, clamped to a sane
+    floor/ceiling. `output_budget` defaults to NUM_CTX_OUTPUT_BUDGET but can
+    be overridden (e.g. PAGE_TRANSLATION_OUTPUT_BUDGET for per-page calls).
     """
     estimated_input_tokens = sum(len(t) for t in texts) // 2
     return max(
         NUM_CTX_FLOOR,
-        min(NUM_CTX_CEILING, estimated_input_tokens + NUM_CTX_OUTPUT_BUDGET),
+        min(NUM_CTX_CEILING, estimated_input_tokens + output_budget),
     )
 
 
@@ -74,6 +94,47 @@ def _wants_verbatim(question: str) -> bool:
     """Detect requests for a verbatim line-by-line reproduction rather than a synthesized answer."""
     lowered = question.lower()
     return any(keyword.lower() in lowered for keyword in VERBATIM_INTENT_KEYWORDS)
+
+
+# Shared instruction text for line-by-line reproduction, used by both the
+# plain-chain prompt template and (via _line_instructions_for) the per-page
+# translation loop's system message.
+VERBATIM_INSTRUCTIONS = (
+    "Reproduce the source text below EXACTLY as it appears, line by line, in its "
+    "original order. Do NOT summarize, paraphrase, synthesize into a table, "
+    "deduplicate, or reorganize by topic. Keep every line separate, in the same "
+    "sequence as the context. Only insert a source label (e.g. [Source: filename]) "
+    "when switching between different source documents."
+)
+
+# Stricter instructions used instead of VERBATIM_INSTRUCTIONS when the question
+# asks for a translation. A weak "if a translation is requested, place it after
+# each line" conditional buried inside VERBATIM_INSTRUCTIONS turned out to be
+# unreliable across independent per-page calls: some pages skipped translating
+# entirely, others dumped a whole translated block after the whole original
+# block instead of interleaving line by line. This spells out the exact
+# required structure so every page follows the same, unambiguous format.
+TRANSLATION_LINE_INSTRUCTIONS = (
+    "Reproduce AND translate the source text below, line by line, in its original "
+    "order. For EVERY line of source content, output exactly two lines in this "
+    "order: (1) the original source line, unmodified, then (2) immediately below "
+    "it, its translation. Repeat this original-then-translation pair for every "
+    "single line in the source, all the way through — never batch all original "
+    "lines together followed by all translations as separate blocks, never merge "
+    "multiple original lines into one translated line, and never skip translating "
+    "a line. Do NOT summarize, paraphrase, deduplicate, or reorganize by topic — "
+    "preserve the exact order and every line, including row/section labels (e.g. "
+    "R1, R2, 耳部). Only insert a source label (e.g. [Source: filename]) when "
+    "switching between different source documents.\n\n"
+    "Example of the required format (source line, then its translation, repeated "
+    "for every line — never all originals first followed by all translations):\n"
+    "R1 : 全下针\n"
+    "R1: 전체 아래뜨기\n"
+    "R2 : 2下针，加针 [3针]\n"
+    "R2: 2 아래뜨기, 코늘림 [3코]\n"
+    "Follow this exact pattern for every line below, and do not repeat any line "
+    "or block twice."
+)
 
 
 # Explicit language names → tesseract OCR language codes. Used to narrow the
@@ -109,6 +170,79 @@ def _detect_ocr_language_override(question: str) -> Optional[str]:
             if part not in codes:
                 codes.append(part)
     return "+".join(codes)
+
+
+def _wants_translation(question: str) -> bool:
+    """True if the question asks for a translation (reuses TRANSLATION_INTENT_KEYWORDS,
+    the same keyword set _detect_ocr_language_override uses). A translation request
+    inherently means "reproduce every line, translated" — not "synthesize a summary" —
+    even when it doesn't also contain an explicit verbatim keyword like "그대로"."""
+    return any(keyword in question for keyword in TRANSLATION_INTENT_KEYWORDS)
+
+
+def _wants_verbatim_or_translation(question: str) -> bool:
+    """Combined gate for picking the line-by-line template, disabling thinking
+    mode, and (for full-document context) triggering the per-page generation loop."""
+    return _wants_verbatim(question) or _wants_translation(question)
+
+
+def _line_instructions_for(question: str) -> str:
+    """Pick strict original+translation interleaving instructions when the
+    question asks for a translation, vs plain verbatim reproduction otherwise."""
+    return TRANSLATION_LINE_INSTRUCTIONS if _wants_translation(question) else VERBATIM_INSTRUCTIONS
+
+
+# Heuristics below catch two failure modes observed from qwen3:14b on the
+# per-page translation task even with TRANSLATION_LINE_INSTRUCTIONS' explicit
+# instructions + few-shot example: (1) dumping all original lines first
+# followed by all translations as a separate block instead of interleaving,
+# or skipping translation entirely, and (2) generating the whole page's
+# content twice in a single response. Both are checked structurally rather
+# than by re-reading the model's own claim about what it did.
+_HANGUL_RE = re.compile(r'[가-힣]')
+
+
+def _looks_correctly_interleaved(text: str) -> bool:
+    """False if a translation-mode response looks like a block of original
+    lines followed by a separate block of translated (Hangul) lines, or
+    contains no Hangul at all despite translation being requested."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 4:
+        return True  # too short to meaningfully judge structure
+    has_hangul = [bool(_HANGUL_RE.search(ln)) for ln in lines]
+    if not any(has_hangul):
+        return False  # no translation anywhere
+    midpoint = len(lines) // 2
+    first_half_ratio = sum(has_hangul[:midpoint]) / midpoint
+    second_half_ratio = sum(has_hangul[midpoint:]) / (len(lines) - midpoint)
+    # Properly interleaved output has translated lines spread roughly evenly
+    # throughout; almost-none-then-mostly is the "all originals, then all
+    # translations" block failure mode.
+    return not (first_half_ratio < 0.15 and second_half_ratio > 0.6)
+
+
+def _looks_duplicated(text: str) -> bool:
+    """True if the response contains a contiguous block of one or more lines
+    that is immediately repeated back-to-back — covers all observed failure
+    modes: the WHOLE page generated twice (a large block), a short
+    watermark/header snippet echoed twice before the real content starts (a
+    small block at the front), and individual lines each doubled up in a row
+    (AABBCC — distinct from a large repeated block, so a block-only scan
+    starting at k=2 misses it). A single exactly-repeated line is virtually
+    never legitimate here: every real content line carries a distinguishing
+    row/section label (R1 vs R2, etc.), so two byte-identical adjacent lines
+    is a generation glitch, not coincidence."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    n = len(lines)
+    if n < 2:
+        return False
+    # Check adjacent-block repeats lines[i:i+k] == lines[i+k:i+2k], from the
+    # largest possible block down to a single line.
+    for k in range(n // 2, 0, -1):
+        for i in range(0, n - 2 * k + 1):
+            if lines[i:i + k] == lines[i + k:i + 2 * k]:
+                return True
+    return False
 
 
 class RAGService:
@@ -213,6 +347,214 @@ class RAGService:
             })
         reasoning_steps.append(f"✅ 재-OCR로 {len(docs)}개 청크 재추출: {pdf.name}")
         return docs
+
+    def _invoke_with_continuation(
+        self,
+        llm: ChatOllama,
+        messages: List[BaseMessage],
+        reasoning_steps: List[str],
+        label: str = "",
+    ) -> Tuple[str, bool]:
+        """Invoke `llm` and, if Ollama's done_reason signals the response was cut
+        off before finishing naturally (anything other than "stop"), retry up to
+        MAX_CONTINUATION_ATTEMPTS times asking the model to continue exactly
+        where it left off, instead of silently returning a partial answer.
+
+        Returns (full_text, truncated) — truncated is True only if the retry
+        cap was hit and the last attempt still didn't end in "stop".
+        """
+        full_text = ""
+        for attempt in range(MAX_CONTINUATION_ATTEMPTS + 1):
+            ai_message = llm.invoke(messages)
+            chunk = ai_message.content or ""
+            full_text += chunk
+            done_reason = ai_message.response_metadata.get("done_reason")
+
+            if done_reason == "stop" or not chunk:
+                return full_text, False
+            if attempt == MAX_CONTINUATION_ATTEMPTS:
+                reasoning_steps.append(
+                    f"⚠️ {label}응답이 잘렸습니다 (done_reason={done_reason}) — "
+                    f"{MAX_CONTINUATION_ATTEMPTS}회 이어쓰기 후에도 미완료"
+                )
+                return full_text, True
+
+            reasoning_steps.append(
+                f"↪️ {label}응답이 중간에 잘림 (done_reason={done_reason}) — "
+                f"이어쓰기 {attempt + 1}/{MAX_CONTINUATION_ATTEMPTS}"
+            )
+            messages = messages + [
+                AIMessage(content=chunk),
+                HumanMessage(content=(
+                    "Continue exactly where you left off. Do not repeat any earlier "
+                    "lines and do not add commentary — output only the continuation."
+                )),
+            ]
+        return full_text, True
+
+    def _invoke_ollama_chat_with_continuation(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        num_ctx: int,
+        reasoning_steps: List[str],
+    ) -> Tuple[str, bool]:
+        """Raw-ollama-client equivalent of _invoke_with_continuation, for the
+        think=True path (kept on the raw client so the existing "💡 Model's
+        chain-of-thought" reasoning_steps entries keep working)."""
+        full_text = ""
+        for attempt in range(MAX_CONTINUATION_ATTEMPTS + 1):
+            ollama_response = ollama.chat(
+                model=model, messages=messages, think=True, stream=False,
+                options={"num_ctx": num_ctx},
+            )
+            if getattr(ollama_response.message, "thinking", None):
+                thinking_text = ollama_response.message.thinking
+                reasoning_steps.append(
+                    f"💡 Model's chain-of-thought:\n{thinking_text[:500]}"
+                    f"{'...' if len(thinking_text) > 500 else ''}"
+                )
+            chunk = ollama_response.message.content or ""
+            full_text += chunk
+            done_reason = ollama_response.done_reason
+
+            if done_reason == "stop" or not chunk:
+                return full_text, False
+            if attempt == MAX_CONTINUATION_ATTEMPTS:
+                reasoning_steps.append(f"⚠️ 응답이 잘렸습니다 (done_reason={done_reason}) — "
+                                        f"{MAX_CONTINUATION_ATTEMPTS}회 이어쓰기 후에도 미완료")
+                return full_text, True
+
+            reasoning_steps.append(
+                f"↪️ 응답이 중간에 잘림 (done_reason={done_reason}) — "
+                f"이어쓰기 {attempt + 1}/{MAX_CONTINUATION_ATTEMPTS}"
+            )
+            messages = messages + [
+                {"role": "assistant", "content": chunk},
+                {"role": "user", "content": (
+                    "Continue exactly where you left off. Do not repeat any earlier "
+                    "lines and do not add commentary — output only the continuation."
+                )},
+            ]
+        return full_text, True
+
+    def _translate_pages(
+        self,
+        docs: List[Document],
+        question: str,
+        model: str,
+        reasoning_steps: List[str],
+    ) -> Tuple[str, bool, List[int]]:
+        """Reproduce/translate a multi-page document one page at a time so each
+        call's required OUTPUT size is bounded by a single page's content
+        instead of the whole document — the actual fix for full-document
+        translations silently cutting off partway through. Thinking mode is
+        disabled per-page (reasoning=False): chain-of-thought reasoning adds
+        no value to a mechanical line-by-line task and would otherwise eat
+        into the same per-call output budget as the visible answer.
+
+        Each page is independent: a HARD failure on one page (e.g. Ollama
+        itself crashing mid-generation) is retried up to MAX_PAGE_RETRY_ATTEMPTS
+        times, and if it still fails, that page is recorded as failed and the
+        loop continues to the next page — every other page's already-completed
+        translation is kept. Nothing gets thrown away because one page had a
+        bad run.
+
+        Returns (concatenated_answer, any_page_truncated, failed_page_numbers).
+        failed_page_numbers is empty when every page eventually succeeded.
+        """
+        page_outputs: List[str] = []
+        any_truncated = False
+        failed_pages: List[int] = []
+
+        for i, doc in enumerate(docs):
+            source = doc.metadata.get("pdf_name", "Unknown")
+            page_label = f"{i + 1}/{len(docs)}"
+            reasoning_steps.append(f"📄 페이지 {page_label} 처리 중... ({source})")
+
+            page_num_ctx = _estimate_num_ctx(
+                doc.page_content, question, self.priority_context,
+                output_budget=PAGE_TRANSLATION_OUTPUT_BUDGET,
+            )
+            instructions = _line_instructions_for(question)
+            system_message = (
+                f"{self.priority_context}{instructions} This is page {i + 1} of "
+                f"{len(docs)} of the same document — do not add a page-transition "
+                "summary or commentary, just the reproduced/translated lines for THIS page.\n\n"
+                f"Context (page {i + 1}/{len(docs)}, source: {source}):\n{doc.page_content}"
+            )
+            messages: List[BaseMessage] = [
+                SystemMessage(content=system_message),
+                HumanMessage(content=f"Question: {question}\n\nOutput this page's content now:"),
+            ]
+
+            translation_requested = _wants_translation(question)
+            page_text: Optional[str] = None
+            truncated = False
+            last_error: Optional[Exception] = None
+            format_issue: Optional[str] = None
+            attempt_messages = messages
+
+            for retry in range(MAX_PAGE_RETRY_ATTEMPTS + 1):
+                last_error = None
+                format_issue = None
+                try:
+                    page_llm = ChatOllama(model=model, num_ctx=page_num_ctx, reasoning=False)
+                    page_text, truncated = self._invoke_with_continuation(
+                        page_llm, attempt_messages, reasoning_steps, label=f"[페이지 {page_label}] "
+                    )
+                except Exception as e:
+                    last_error = e
+
+                # Format issues only apply when the call itself succeeded and
+                # a translation was actually requested for this page.
+                if last_error is None and translation_requested and page_text:
+                    if _looks_duplicated(page_text):
+                        format_issue = "응답이 중복 생성됨"
+                    elif not _looks_correctly_interleaved(page_text):
+                        format_issue = "원문/번역이 줄 단위로 교차되지 않음"
+
+                if last_error is None and format_issue is None:
+                    break  # success
+                if retry == MAX_PAGE_RETRY_ATTEMPTS:
+                    break  # out of retries — handled below
+
+                if last_error is not None:
+                    reasoning_steps.append(
+                        f"⚠️ 페이지 {page_label} 처리 중 오류 ({last_error}) — "
+                        f"재시도 {retry + 1}/{MAX_PAGE_RETRY_ATTEMPTS}"
+                    )
+                    attempt_messages = messages
+                    time.sleep(PAGE_RETRY_BACKOFF_SECONDS)
+                else:
+                    reasoning_steps.append(
+                        f"⚠️ 페이지 {page_label} 형식 검증 실패 ({format_issue}) — "
+                        f"재시도 {retry + 1}/{MAX_PAGE_RETRY_ATTEMPTS}"
+                    )
+                    attempt_messages = messages + [
+                        AIMessage(content=page_text),
+                        HumanMessage(content=(
+                            f"That output was rejected: {format_issue}. Redo this page "
+                            "from scratch following the exact original-line-then-"
+                            "translation-line interleaved format shown earlier, with "
+                            "no duplicated content."
+                        )),
+                    ]
+
+            if last_error is not None:
+                failed_pages.append(i + 1)
+                page_outputs.append(f"⚠️ [페이지 {page_label} 처리 실패: {last_error}]")
+                reasoning_steps.append(f"❌ 페이지 {page_label} 최종 실패 — 다음 페이지로 진행")
+                continue
+
+            if format_issue is not None:
+                reasoning_steps.append(f"⚠️ 페이지 {page_label} 형식 문제 남음 ({format_issue}) — 결과는 유지")
+
+            any_truncated = any_truncated or truncated
+            page_outputs.append(page_text.strip())
+            reasoning_steps.append(f"✅ 페이지 {page_label} 완료")
+
+        return "\n\n".join(page_outputs), any_truncated, failed_pages
 
     def query_multi_pdf(
         self,
@@ -372,30 +714,52 @@ class RAGService:
         formatted_context = "\n---\n".join(context_parts)
         reasoning_steps.append(f"🔗 Using {min(len(all_docs), context_limit)} chunk(s) for context")
 
-        verbatim_mode = _wants_verbatim(question)
+        verbatim_mode = _wants_verbatim_or_translation(question)
         reasoning_steps.append(
             f"📝 Answer mode: {'verbatim line-by-line reproduction' if verbatim_mode else 'synthesized answer'}"
         )
 
-        if verbatim_mode:
-            # Reproduce source lines as-is — explicitly forbid summarizing,
-            # paraphrasing, or reorganizing into tables.
-            template = """{priority_context}Reproduce the source text below EXACTLY as it appears, line by line, in its original order.
-        Do NOT summarize, paraphrase, synthesize into a table, deduplicate, or reorganize by topic.
-        Keep every line separate, in the same sequence as the context. If a translation is requested,
-        place the translation immediately after each original line (still one line at a time) — never
-        merge multiple lines into a single summarized statement.
-        Only insert a source label (e.g. [Source: filename]) when switching between different source documents.
+        # Check if model supports thinking (e.g., qwen3, deepseek-r1). Thinking
+        # is disabled for verbatim/translation requests: chain-of-thought
+        # reasoning adds no value to a mechanical line-by-line task and would
+        # otherwise eat into the same output budget as the visible answer.
+        thinking_models = ['qwen3', 'deepseek-r1', 'qwen', 'deepseek']
+        supports_thinking = any(tm in model.lower() for tm in thinking_models)
+        use_thinking = supports_thinking and not verbatim_mode
+
+        # A large multi-page verbatim/translation request is translated one
+        # page at a time instead of in one giant call, so no single call's
+        # required output can exceed a bound tied to one page's content —
+        # this is what actually fixes full-document translations silently
+        # cutting off partway through (see _translate_pages docstring).
+        use_page_loop = use_full_context and verbatim_mode and len(all_docs[:context_limit]) > 1
+
+        if use_page_loop:
+            reasoning_steps.append(
+                f"🔀 다중 페이지 verbatim/번역 요청 감지 — 페이지별 생성 루프 사용 "
+                f"({len(all_docs[:context_limit])}페이지, 응답 잘림 방지 + 사고모드 비활성화)"
+            )
+            response, truncated, failed_pages = self._translate_pages(
+                all_docs[:context_limit], question, model, reasoning_steps
+            )
+        else:
+            failed_pages = []
+            if verbatim_mode:
+                # Reproduce (and, if requested, translate) source lines as-is —
+                # explicitly forbid summarizing, paraphrasing, or reorganizing.
+                template = (
+                    "{priority_context}" + _line_instructions_for(question) + """
 
         Context:
         {context}
 
         Question: {question}
 
-        Output the content line by line, in original order, exactly as written in the context:"""
-        else:
-            # RAG prompt template with chain-of-thought
-            template = """{priority_context}Answer the question based ONLY on the following context from multiple PDF documents.
+        Output the content line by line, in original order:"""
+                )
+            else:
+                # RAG prompt template with chain-of-thought
+                template = """{priority_context}Answer the question based ONLY on the following context from multiple PDF documents.
         Each section is marked with its source document.
 
         Use chain-of-thought reasoning:
@@ -413,52 +777,16 @@ class RAGService:
 
         Think step-by-step and provide your answer with source citations:"""
 
-        # Size the answer-generation model's context window to what we're
-        # actually sending it, instead of relying on Ollama's default
-        # (often 2048 tokens) which can silently truncate long contexts.
-        num_ctx = _estimate_num_ctx(template, formatted_context, self.priority_context, question)
-        reasoning_steps.append(f"🧮 Sizing model context window: num_ctx={num_ctx}")
-        answer_llm = ChatOllama(model=model, num_ctx=num_ctx)
+            # Size the answer-generation model's context window to what we're
+            # actually sending it, instead of relying on Ollama's default
+            # (often 2048 tokens) which can silently truncate long contexts.
+            num_ctx = _estimate_num_ctx(template, formatted_context, self.priority_context, question)
+            reasoning_steps.append(f"🧮 Sizing model context window: num_ctx={num_ctx}")
+            reasoning_steps.append("💭 Generating answer with source citations...")
 
-        prompt = ChatPromptTemplate.from_template(template)
-        chain = (
-            {
-                "context": lambda x: formatted_context,
-                "question": lambda x: x,
-                "priority_context": lambda x: self.priority_context,
-            }
-            | prompt
-            | answer_llm
-            | StrOutputParser()
-        )
-
-        reasoning_steps.append("💭 Generating answer with source citations...")
-
-        # Check if model supports thinking (e.g., qwen3, deepseek-r1)
-        thinking_models = ['qwen3', 'deepseek-r1', 'qwen', 'deepseek']
-        supports_thinking = any(tm in model.lower() for tm in thinking_models)
-
-        if supports_thinking:
-            reasoning_steps.append("🧠 Using thinking-enabled model with chain-of-thought reasoning...")
-            try:
-                # Enhanced system message for chain-of-thought reasoning
-                if verbatim_mode:
-                    cot_system_message = f"""You are an expert AI assistant reproducing source text exactly as written.
-
-{self.priority_context}Reproduce the source text below EXACTLY as it appears, line by line, in its original
-order. Do NOT summarize, paraphrase, synthesize into a table, deduplicate, or reorganize by topic.
-Keep every line separate, in the same sequence as the context. If a translation is requested, place
-the translation immediately after each original line (still one line at a time) — never merge
-multiple lines into a single summarized statement. Only insert a source label (e.g. [Source: filename])
-when switching between different source documents.
-
-Context from PDF documents:
-{formatted_context}
-
-Think about the correct line order and any requested translation, then output the content line by
-line, in original order, exactly as written in the context."""
-                else:
-                    cot_system_message = f"""You are an expert AI assistant that uses chain-of-thought reasoning.
+            if use_thinking:
+                reasoning_steps.append("🧠 Using thinking-enabled model with chain-of-thought reasoning...")
+                cot_system_message = f"""You are an expert AI assistant that uses chain-of-thought reasoning.
 
 {self.priority_context}Answer the question based ONLY on the provided context from PDF documents.
 
@@ -474,31 +802,31 @@ Context from PDF documents:
 {formatted_context}
 
 Think through each step carefully, showing your reasoning process."""
+                try:
+                    response, truncated = self._invoke_ollama_chat_with_continuation(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": cot_system_message},
+                            {"role": "user", "content": f"Question: {question}\n\nThink step-by-step and provide a detailed answer with source citations."}
+                        ],
+                        num_ctx=num_ctx,
+                        reasoning_steps=reasoning_steps,
+                    )
+                except Exception as e:
+                    print(f"Error using thinking mode, falling back to standard: {e}")
+                    use_thinking = False  # fall through to the plain path below
 
-                # Use Ollama client directly for thinking-capable models
-                ollama_response = ollama.chat(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": cot_system_message},
-                        {"role": "user", "content": f"Question: {question}\n\nThink step-by-step and provide a detailed answer with source citations."}
-                    ],
-                    think=True,
-                    stream=False,
-                    options={"num_ctx": num_ctx}
+            if not use_thinking:
+                answer_llm = ChatOllama(model=model, num_ctx=num_ctx, reasoning=False)
+                prompt = ChatPromptTemplate.from_template(template)
+                prompt_messages = prompt.invoke({
+                    "context": formatted_context,
+                    "question": question,
+                    "priority_context": self.priority_context,
+                }).to_messages()
+                response, truncated = self._invoke_with_continuation(
+                    answer_llm, prompt_messages, reasoning_steps
                 )
-
-                # Add thinking process to reasoning steps
-                if hasattr(ollama_response.message, 'thinking') and ollama_response.message.thinking:
-                    thinking_text = ollama_response.message.thinking
-                    # Show more of the thinking process (500 chars instead of 200)
-                    reasoning_steps.append(f"💡 Model's chain-of-thought:\n{thinking_text[:500]}{'...' if len(thinking_text) > 500 else ''}")
-
-                response = ollama_response.message.content
-            except Exception as e:
-                print(f"Error using thinking mode, falling back to standard: {e}")
-                response = chain.invoke(question)
-        else:
-            response = chain.invoke(question)
 
         # Extract source information
         sources = [
@@ -510,7 +838,23 @@ Think through each step carefully, showing your reasoning process."""
             for doc in all_docs[:context_limit]
         ]
 
-        reasoning_steps.append("✨ Answer generated successfully!")
+        # Never silently claim success on a response that Ollama itself
+        # reported as cut off before a natural stop, even after retries —
+        # and never silently drop pages that hard-failed even after retries.
+        if failed_pages:
+            page_list = ", ".join(str(p) for p in failed_pages)
+            response = response + (
+                f"\n\n⚠️ [참고: 페이지 {page_list}는 반복된 오류로 처리하지 못했습니다 — "
+                "나머지 페이지는 정상적으로 포함되어 있습니다.]"
+            )
+            reasoning_steps.append(f"⚠️ 페이지 {page_list} 최종 실패 — 나머지는 정상 반환")
+
+        if truncated:
+            response = response + "\n\n⚠️ [참고: 이 답변은 완전히 생성되지 못했을 수 있습니다 — 응답이 중간에 잘렸습니다.]"
+            reasoning_steps.append("⚠️ 답변이 불완전하게 생성되었습니다 (이어쓰기 시도 후에도 완료되지 않음)")
+
+        if not failed_pages and not truncated:
+            reasoning_steps.append("✨ Answer generated successfully!")
 
         return response, sources, reasoning_steps
 
