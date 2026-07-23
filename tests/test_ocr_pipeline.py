@@ -6,6 +6,7 @@ from langchain_core.documents import Document
 
 from src.core.document import _check_single_char_pattern, _is_ocr_artifact_text, detect_if_image_based
 from src.core.image_handler import OPENCV_AVAILABLE, ImageHandler
+from src.api.services.rag_service import _detect_ocr_language_override
 
 SAMPLE_SCANNED_PDF = Path("data/pdfs/uploads")
 
@@ -73,3 +74,21 @@ def test_remove_watermark_reduces_ocr_garbage():
     assert _is_ocr_artifact_text(cleaned_text) is False or _is_ocr_artifact_text(
         raw_text
     ) is True
+
+
+def test_detect_ocr_language_override_source_and_target_named():
+    assert _detect_ocr_language_override("중국어 도안을 한국어로 번역해줘") == "chi_sim+chi_tra+kor"
+
+
+def test_detect_ocr_language_override_english_and_korean_named():
+    assert _detect_ocr_language_override("영어를 한국어로 번역해줘") == "kor+eng"
+
+
+def test_detect_ocr_language_override_no_translation_keyword():
+    assert _detect_ocr_language_override("이 문서를 요약해줘") is None
+
+
+def test_detect_ocr_language_override_only_one_language_named():
+    # Needs an explicit source AND target — a single named language isn't enough.
+    assert _detect_ocr_language_override("중국어를 번역해줘") is None
+    assert _detect_ocr_language_override("한국어로 요약해줘") is None

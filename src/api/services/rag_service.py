@@ -20,6 +20,7 @@ from langchain_ollama import OllamaEmbeddings
 
 from ..database import PDFMetadata, ChatSession, ChatMessage
 from ..config import settings
+from ...core.text_extractor import TextExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,41 @@ def _wants_verbatim(question: str) -> bool:
     """Detect requests for a verbatim line-by-line reproduction rather than a synthesized answer."""
     lowered = question.lower()
     return any(keyword.lower() in lowered for keyword in VERBATIM_INTENT_KEYWORDS)
+
+
+# Explicit language names → tesseract OCR language codes. Used to narrow the
+# OCR language pack for a single query when the question names a source/target
+# translation pair (e.g. "중국어 도안을 한국어로 번역해줘"). "eng" is deliberately
+# NOT in DEFAULT_OCR_LANGUAGE's replacement here unless English is one of the
+# named languages — mixing in an unneeded English dictionary measurably
+# degrades Tesseract's CJK recognition (e.g. "下针" misread as "FH, Get,").
+_LANGUAGE_NAME_TO_OCR_CODE = {
+    "중국어": "chi_sim+chi_tra",
+    "한국어": "kor",
+    "영어": "eng",
+}
+TRANSLATION_INTENT_KEYWORDS = ["번역"]
+
+
+def _detect_ocr_language_override(question: str) -> Optional[str]:
+    """Detect an explicit source+target language pair in a translation-style
+    question and return a narrowed tesseract language string, e.g.
+    "chi_sim+chi_tra+kor" for "중국어가 source, 한국어가 target". Returns None
+    (keep DEFAULT_OCR_LANGUAGE, which still includes "eng") unless both a
+    translation-intent keyword AND at least two distinct languages are named —
+    a single language mention isn't enough to safely narrow the language pack.
+    """
+    if not any(keyword in question for keyword in TRANSLATION_INTENT_KEYWORDS):
+        return None
+    matched_names = [name for name in _LANGUAGE_NAME_TO_OCR_CODE if name in question]
+    if len(matched_names) < 2:
+        return None
+    codes: List[str] = []
+    for name in matched_names:
+        for part in _LANGUAGE_NAME_TO_OCR_CODE[name].split("+"):
+            if part not in codes:
+                codes.append(part)
+    return "+".join(codes)
 
 
 class RAGService:
@@ -136,6 +172,48 @@ class RAGService:
             + "\n\n"
         )
 
+    def _reocr_pdf_chunks(
+        self,
+        pdf: PDFMetadata,
+        ocr_language: str,
+        reasoning_steps: List[str],
+    ) -> Optional[List[Document]]:
+        """Re-run OCR on `pdf`'s original file with a narrower language pack,
+        for this query only — the stored vector DB collection is untouched.
+
+        Returns None (caller falls back to the stored/embedded chunks) when
+        the PDF wasn't originally OCR'd, the file is missing, or extraction
+        yields nothing.
+        """
+        # doc_count == page_count is how the OCR path stores documents (one
+        # chunk per page, see PDFService.upload_and_process); a native-text
+        # PDF chunked at 7500 chars/page almost always produces more chunks
+        # than pages. Imperfect, but avoids re-OCR'ing large native PDFs.
+        if pdf.doc_count != pdf.page_count:
+            return None
+        if not pdf.file_path or not Path(pdf.file_path).exists():
+            reasoning_steps.append(f"⚠️ 재-OCR 건너뜀 — 원본 파일을 찾을 수 없음: {pdf.name}")
+            return None
+
+        reasoning_steps.append(f"🔁 재-OCR 중 ({ocr_language}): {pdf.name}")
+        extractor = TextExtractor()
+        extraction_result = extractor.extract_text_from_scanned_pdf(
+            Path(pdf.file_path), ocr_language=ocr_language
+        )
+        docs = extractor.create_document_chunks(extraction_result)
+        if not docs:
+            reasoning_steps.append(f"⚠️ 재-OCR 결과 없음 — 기존 저장된 청크로 대체: {pdf.name}")
+            return None
+
+        for i, doc in enumerate(docs):
+            doc.metadata.update({
+                "pdf_id": pdf.pdf_id,
+                "pdf_name": pdf.name,
+                "chunk_index": i,
+            })
+        reasoning_steps.append(f"✅ 재-OCR로 {len(docs)}개 청크 재추출: {pdf.name}")
+        return docs
+
     def query_multi_pdf(
         self,
         question: str,
@@ -167,6 +245,15 @@ class RAGService:
 
         reasoning_steps.append(f"📚 Searching across {len(pdfs)} PDF(s): {', '.join([p.name for p in pdfs])}")
 
+        # An explicit "중국어 도안을 한국어로 번역해줘"-style question narrows OCR to
+        # just the named source+target languages for THIS query (re-OCR from the
+        # original file, not persisted back to the stored vector DB/collection).
+        ocr_language_override = _detect_ocr_language_override(question)
+        if ocr_language_override:
+            reasoning_steps.append(
+                f"🔤 번역 요청 감지 — 이번 질의에 한해 OCR 언어를 '{ocr_language_override}'로 좁혀서 원본 PDF를 다시 읽습니다"
+            )
+
         # Initialize LLM (used for query-generation only; the final answer
         # call gets its own instance sized to the actual context below)
         llm = ChatOllama(model=model)
@@ -187,6 +274,14 @@ class RAGService:
             )
 
             for pdf in pdfs:
+                docs = None
+                if ocr_language_override:
+                    docs = self._reocr_pdf_chunks(pdf, ocr_language_override, reasoning_steps)
+
+                if docs is not None:
+                    all_docs.extend(docs)
+                    continue
+
                 vector_db = Chroma(
                     persist_directory=self.persist_directory,
                     embedding_function=embeddings,
@@ -227,6 +322,11 @@ class RAGService:
             )
 
             reasoning_steps.append("🔍 Generating alternative search queries...")
+            if ocr_language_override:
+                reasoning_steps.append(
+                    "ℹ️ 재-OCR 언어 좁히기는 전체-문서 모드에서만 지원됩니다 (선택한 PDF가 많아 "
+                    "유사도 검색 모드로 전환됨) — 기존 저장된 청크를 그대로 사용합니다"
+                )
 
             for pdf in pdfs:
                 vector_db = Chroma(
