@@ -36,8 +36,6 @@ interface QueryResponse {
     pdfs_queried: number;
     reasoning_steps?: string[];
   };
-  session_id: string;
-  message_id: number;
 }
 
 export async function ollamaChat(
@@ -60,7 +58,6 @@ export async function ollamaChat(
     body: JSON.stringify({
       question,
       model,
-      session_id: null,
       pdf_ids: pdfIds, // Filter to specific PDFs if provided
     }),
     // @ts-expect-error -- `dispatcher` is a Node/undici fetch extension not in the DOM lib types

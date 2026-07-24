@@ -30,7 +30,6 @@ class QueryRequest(BaseModel):
     question: str
     model: str = "mistral:latest"
     pdf_ids: Optional[List[str]] = None
-    session_id: Optional[str] = None
 
 
 class SourceInfo(BaseModel):
@@ -45,8 +44,6 @@ class QueryResponse(BaseModel):
     answer: str
     sources: List[SourceInfo]
     metadata: Dict[str, Any]
-    session_id: str
-    message_id: int
 
 
 class ModelInfo(BaseModel):

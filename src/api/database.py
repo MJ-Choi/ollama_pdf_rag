@@ -1,5 +1,5 @@
 """Database models and session management."""
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, JSON
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from pathlib import Path
@@ -37,25 +37,18 @@ class PDFMetadata(Base):
     file_path = Column(String)
 
 
-class ChatSession(Base):
-    """Chat session table."""
-    __tablename__ = "chat_sessions"
-
-    session_id = Column(String, primary_key=True)
-    created_at = Column(DateTime, nullable=False)
-    last_active = Column(DateTime, nullable=False)
-
-
-class ChatMessage(Base):
-    """Chat message table."""
-    __tablename__ = "messages"
-
-    message_id = Column(Integer, primary_key=True, autoincrement=True)
-    session_id = Column(String, nullable=False)
-    role = Column(String, nullable=False)
-    content = Column(String, nullable=False)
-    sources = Column(JSON)
-    timestamp = Column(DateTime, nullable=False)
+# Note: this backend previously had ChatSession/ChatMessage models logging
+# every query to `chat_sessions`/`messages` tables. Removed 2026-07-23: the
+# session_id was never read back into an LLM call (fully stateless,
+# single-turn RAG regardless), the frontend always sent session_id=null (so
+# the backend minted a fresh UUID per query — one "session" per turn, not
+# per conversation), and nothing in the repo ever called
+# GET /sessions/{id}/messages. It was a write-only log nobody read. The
+# Next.js frontend's own `web-ui/data/chat.db` (Drizzle) is the actual,
+# load-bearing chat history — sidebar list, resume, delete, titles. The old
+# `chat_sessions`/`messages` tables (and their historical rows) are left
+# untouched in api.db as harmless residual data — see scripts/cleanup_orphans.py
+# for the class of cleanup that could eventually remove them too.
 
 
 # Create all tables

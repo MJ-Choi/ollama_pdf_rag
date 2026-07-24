@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from sqlalchemy.orm import Session
-from datetime import datetime
 
 from langchain_ollama import ChatOllama
 import ollama
@@ -20,7 +19,7 @@ except ImportError:
     from langchain_community.vectorstores import Chroma
 from langchain_ollama import OllamaEmbeddings
 
-from ..database import PDFMetadata, ChatSession, ChatMessage
+from ..database import PDFMetadata
 from ..config import settings
 from ...core.text_extractor import TextExtractor, CJK_OCR_LANGUAGE
 
@@ -1083,63 +1082,3 @@ Think through each step carefully, showing your reasoning process."""
             reasoning_steps.append("✨ Answer generated successfully!")
 
         return response, sources, reasoning_steps
-
-    def save_message(
-        self,
-        session_id: str,
-        role: str,
-        content: str,
-        sources: Optional[List[Dict]],
-        db: Session
-    ) -> ChatMessage:
-        """Save chat message to database.
-
-        Args:
-            session_id: Chat session identifier
-            role: Message role (user or assistant)
-            content: Message content
-            sources: Source documents (for assistant messages)
-            db: Database session
-
-        Returns:
-            Saved chat message
-        """
-        # Ensure session exists
-        session = db.query(ChatSession).filter(ChatSession.session_id == session_id).first()
-        if not session:
-            session = ChatSession(
-                session_id=session_id,
-                created_at=datetime.now(),
-                last_active=datetime.now()
-            )
-            db.add(session)
-        else:
-            session.last_active = datetime.now()
-
-        # Save message
-        message = ChatMessage(
-            session_id=session_id,
-            role=role,
-            content=content,
-            sources=sources,
-            timestamp=datetime.now()
-        )
-        db.add(message)
-        db.commit()
-        db.refresh(message)
-
-        return message
-
-    def get_session_messages(self, session_id: str, db: Session) -> List[ChatMessage]:
-        """Get all messages for a session.
-
-        Args:
-            session_id: Chat session identifier
-            db: Database session
-
-        Returns:
-            List of chat messages
-        """
-        return db.query(ChatMessage).filter(
-            ChatMessage.session_id == session_id
-        ).order_by(ChatMessage.timestamp).all()

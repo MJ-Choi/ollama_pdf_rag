@@ -6,6 +6,7 @@
 - 클로드는 환경변수 파일(.env*)을 건들지 않는다
 - 답변은 한국어로만 한다
 - Frontend: @web-ui/claude.md
+- DB (ChromaDB / api.db / chat.db) 스키마·구조: @.claude/database.md
 
 ## 프로젝트 개요
 
@@ -30,7 +31,7 @@ Ollama와 LangChain을 사용해 PDF 문서와 대화하는 완전 로컬 RAG(�
 
 **API 계층 (`src/api/`)**:
 - `main.py`: FastAPI 앱 설정. CORS는 `http://localhost:3000`(Next.js)만 허용. `pdfs`, `query`, `models`, `health` 라우터 등록
-- `database.py`: SQLite(`data/api.db`) + SQLAlchemy 모델 3개 — `PDFMetadata`(pdfs), `ChatSession`(chat_sessions), `ChatMessage`(messages). ⚠️ 라이브 DB에 `analysis_results` 테이블이 있으나 이는 미완성 analyze 기능의 잔재로, 현재 코드 어디에도 모델/사용처가 없음
+- `database.py`: SQLite(`data/api.db`) + SQLAlchemy 모델. 상세 스키마·잔재 테이블은 @.claude/database.md 참조
 - `routers/`: `pdfs`(업로드/목록/삭제), `query`(RAG 질의 + 세션 메시지 조회), `models`(Ollama 모델 목록), `health`
 - `services/`: `pdf_service.py`(업로드→OCR→청크→임베딩), `rag_service.py`(질의 오케스트레이션 — 이 파일이 사실상 RAG의 전부)
 - `config.py`: Ollama 연결 설정 (기본 http://localhost:11434)
@@ -45,10 +46,11 @@ Ollama와 LangChain을 사용해 PDF 문서와 대화하는 완전 로컬 RAG(�
 
 ### 데이터 저장
 
-- **벡터 DB**: ChromaDB (`data/vectors/`) — PDF 1개당 컬렉션 1개(`collection_name`), OCR 텍스트가 페이지 단위 청크로 저장(`source_page` 메타데이터 포함). ⚠️ **업로드 시점의 OCR 결과가 박제됨** — 질의 시점 재-OCR 결과는 여기 반영되지 않음(재업로드해야 갱신)
+3개 DB(ChromaDB, API DB, 프론트엔드 DB)의 스키마·구조·알려진 이슈는 @.claude/database.md 참조. 요약:
+- **벡터 DB**: ChromaDB (`data/vectors/`) — PDF 1개당 컬렉션 1개. ⚠️ 업로드 시점 OCR 결과가 박제됨(재-OCR은 그 질의에만 반영, 컬렉션 자체를 갱신하려면 `refresh_ocr`)
 - **원본 PDF**: `data/pdfs/uploads/` (`{pdf_id}_{파일명}`) — 재-OCR이 읽는 원본
-- **API DB**: SQLite `data/api.db` — PDF 메타데이터, 백엔드 채팅 기록
-- **프론트엔드 DB**: `web-ui/data/chat.db` (Drizzle ORM + better-sqlite3) — 프론트 채팅 기록 (백엔드와 이중 저장됨)
+- **API DB**: SQLite `data/api.db` — PDF 메타데이터(`PDFMetadata`)만 관리. 채팅 기록은 여기 없음(2026-07-23 제거, 아래 "알려진 문제점" 6번 참조)
+- **프론트엔드 DB**: `web-ui/data/chat.db` (Drizzle ORM + better-sqlite3) — **유일한 채팅 기록**
 
 ## 개발 명령어
 
@@ -186,7 +188,7 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 - **벡터 DB 손상**: `data/vectors/` 삭제 후 PDF 재업로드
 - **프론트 DB 오류**: `pnpm db:migrate`는 빈 `web-ui/data/chat.db`에서도 동작. 대안: `npx tsx web-ui/lib/db/init-db.ts`
 - **중국어 OCR 깨짐**: `ImageHandler.remove_watermark()`가 워터마크를 실제로 제거하는지 전처리 이미지를 덤프해서 먼저 확인
-- **ChromaDB 내용 직접 조회**: `chromadb.PersistentClient(path='data/vectors')` → `get_collection(collection_name)` → `.get(include=['documents','metadatas'])`. `collection_name`은 `data/api.db`의 `pdfs` 테이블에서 조회. 여기 저장된 텍스트는 **업로드 시점** OCR 결과임에 주의
+- **ChromaDB 내용 직접 조회**: 조회 명령어는 @.claude/database.md 참조. 여기 저장된 텍스트는 **업로드 시점** OCR 결과임에 주의
 
 ## 알려진 문제점 및 개선 계획
 
@@ -200,10 +202,12 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
    - 조치: `TRANSLATION_LINE_INSTRUCTIONS`에 "숫자와 단위는 붙여서 표기(12코, 12개의 코 금지)" 규칙 추가 + `_normalize_korean_counts()` 결정적 후처리(정규식 `(\d+)\s*개의\s*코` → `\1코`, `query_multi_pdf`에서 번역 응답에 항상 적용)로 이중 안전망. ⚠️ 정규식에 트레일링 `\b`(단어 경계)를 넣으면 안 됨 — 한글 조사(와/를 등)가 코에 공백 없이 붙어 Python의 유니코드 인식 `\b`가 한글-한글 사이를 경계로 보지 않아 매칭이 조용히 실패함
 4. ✅ **(해결됨, 2026-07-23) 박제된 구버전 OCR 임베딩** — OCR 언어 수정 이전에 업로드된 PDF는 ChromaDB에 깨진 텍스트가 남아 있고, 번역 외 일반 질의는 이 텍스트를 그대로 씀
    - 조치(B안): "재-OCR 결과로 컬렉션 갱신" 기능 추가. `PDFService.refresh_ocr(pdf_id, db, ocr_language=None)` — 원본 파일을 `CJK_OCR_LANGUAGE`(`text_extractor.py`, `chi_sim+chi_tra+kor`)로 재-OCR하고 기존 컬렉션을 삭제 후 **같은 `collection_name`으로 재생성** (`pdf_id`/`collection_name` 불변, `doc_count`/`page_count`만 갱신). `POST /api/v1/pdfs/{pdf_id}/refresh-ocr` 엔드포인트로 노출, 웹 UI 사이드바에 PDF별 새로고침 아이콘(호버 시 노출) 추가. `doc_count != page_count`(원래 OCR 문서가 아님) 또는 원본 파일 없음이면 400, PDF 없음이면 404. `VectorStore.delete_collection_by_name()` 헬퍼 신설(기존 `delete_pdf`의 raw Chroma 생성 코드도 이걸로 정리) — 임의의 컬렉션명을 인스턴스 상태와 무관하게 삭제 가능
-5. **저장소 잔재 정리** — ChromaDB의 0청크 고아 컬렉션 2개, `api.db`의 미사용 `analysis_results` 테이블, 레거시 `core/rag.py`·`core/llm.py`(+ `tests/test_rag.py`)
-   - 개선안: 고아 컬렉션/테이블 삭제 스크립트. 레거시 모듈은 Streamlit 방향성 결정 후 제거 여부 판단
-6. **채팅 기록 이중 저장** — 백엔드 `api.db`와 프론트 `chat.db`에 같은 대화가 따로 저장되어 동기화되지 않음
-   - 개선안: 프론트를 단일 소스로 하고 백엔드 저장은 옵션화, 또는 그 반대. 구조 결정이 필요한 사안이라 별도 논의
+5. 🔧 **(스크립트 준비됨, 2026-07-23) 저장소 잔재 정리** — ChromaDB 고아 컬렉션 3개(2026-07-23 기준: `pdf_632425175926842791`·`pdf_973033043484023512` 0청크, `pdf_7679892920309835191` 1청크 — 전부 `api.db`의 `pdfs` 테이블에 대응 행 없음), `api.db`의 미사용 `analysis_results` 테이블(2행, 코드 어디서도 참조 안 함), 레거시 `core/rag.py`·`core/llm.py`(+ `tests/test_rag.py`)
+   - 조치: `scripts/cleanup_orphans.py` 작성 — `api.db`의 `pdfs.collection_name`과 대조해 대응 행 없는 ChromaDB 컬렉션을 찾고, `analysis_results` 테이블 존재/행수 확인. 기본은 **dry-run**(보고만), `--apply`로 실제 삭제/DROP. 사용자가 직접 실행 여부 결정하기로 하고 아직 미실행(`--apply` 안 돌림) — 재실행 시 orphan 목록이 그 시점 기준으로 다시 계산되므로 위 3개 이름은 참고용
+   - 레거시 모듈(`core/rag.py`, `core/llm.py`, `tests/test_rag.py`)은 Streamlit 방향성 결정 전까지 보류 — 스크립트 범위 아님
+6. ✅ **(해결됨, 2026-07-23) 채팅 기록 이중 저장** — 백엔드 `api.db`와 프론트 `chat.db`에 같은 대화가 따로 저장되어 동기화되지 않음
+   - **조사 결과**: 두 시스템이 같은 역할을 두고 경쟁하는 게 아니었음 — `RAGService.query_multi_pdf()`는 `session_id`를 받지도 않아 세션 히스토리를 답변 생성에 전혀 반영하지 않았고(완전히 무상태·단일턴), 프론트는 `/api/v1/query` 호출 시 항상 `session_id: null`을 보내 백엔드가 **매 질의마다 새 UUID를 생성**(대화 1개 = 세션 여러 개로 쪼개짐, 세션 경계 자체가 깨져 있었음), `GET /sessions/{id}/messages`는 리포지토리 어디서도 호출된 적 없음(문서의 curl 예시가 유일한 참조). 즉 백엔드 쪽은 "제2의 채팅 기록"이 아니라 **아무도 안 읽는 write-only 로그**였음. 반대로 프론트 `chat.db`는 사이드바 히스토리·대화 재개·제목 생성·삭제까지 실제로 동작하는 유일한 진짜 채팅 기록. 두 DB는 같은 커밋(`782a296`, Next.js+FastAPI 동시 도입)에서 조율 없이 각자의 스캐폴딩(Vercel AI Chatbot 템플릿의 Drizzle 저장소 + 새 REST 레이어의 자체 로그)을 그대로 가져오면서 생긴 결과
+   - **조치**: 백엔드의 `ChatSession`/`ChatMessage` 저장 경로를 전부 제거 — `src/api/database.py`(모델 클래스), `src/api/services/rag_service.py`(`save_message()`/`get_session_messages()`), `src/api/routers/query.py`(`GET /sessions/{id}/messages` 엔드포인트, 질의 전후 저장 호출), `src/api/models.py`(`QueryRequest.session_id`, `QueryResponse.session_id`/`message_id`), 프론트 `web-ui/lib/ai/provider.ts`(대응 필드), `docs/api/rest-api.md`. 백엔드는 이제 순수 질의응답 엔진, 프론트 `chat.db`가 유일한 채팅 기록. `api.db`의 물리 `chat_sessions`/`messages` 테이블과 기존 데이터는 `analysis_results`와 같은 성격의 잔재로 남겨둠(제거 안 함) — `scripts/cleanup_orphans.py` 대상에 나중에 포함 가능
 7. **서버 직접 응답 범위 확장** — 현재 페이지 수/페이지 원문만 LLM 우회. 파일명·업로드일·청크 수 등도 같은 패턴으로 확장 가능
 8. **`needsDocumentContext()` 키워드 분류기(route.ts)가 조잡** — "this", "explain" 등 광범위한 영어 키워드라 일반 대화도 문서 질문으로 오분류 가능
 9. **pre-commit이 pytest 대신 unittest 실행** — CI(pytest)와 불일치. `.pre-commit-config.yaml`의 entry를 pytest로 교체 검토
