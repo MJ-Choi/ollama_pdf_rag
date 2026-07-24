@@ -4,7 +4,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable
 from sqlalchemy.orm import Session
 
 from langchain_ollama import ChatOllama
@@ -216,22 +216,63 @@ def _line_instructions_for(question: str) -> str:
     return TRANSLATION_LINE_INSTRUCTIONS if _wants_translation(question) else VERBATIM_INSTRUCTIONS
 
 
-# "How many pages" questions are answerable directly from PDFMetadata.page_count
-# — already known with certainty from the upload-time OCR/chunking pass — so
-# there's no reason to burn an LLM call on it. Worse, the LLM literally has no
-# way to answer this correctly even if asked to: it only ever sees the chunked
-# page TEXT as context, never the page_count metadata itself, so without this
-# short-circuit it always (correctly, from its perspective) says the context
-# doesn't contain that information.
+# Metadata questions (page count, filename, upload date, chunk count) are
+# answerable directly from PDFMetadata — already known with certainty from
+# the upload-time OCR/chunking pass, so there's no reason to burn an LLM
+# call on them. Worse, the LLM literally has no way to answer these
+# correctly even if asked to: the RAG prompt only ever contains chunked page
+# TEXT as context, never PDFMetadata fields, so without a short-circuit it
+# always (correctly, from its perspective) says the context doesn't contain
+# that information.
 PAGE_COUNT_KEYWORDS = [
     "몇 페이지", "페이지 수", "총 페이지", "몇 장",
     "how many pages", "page count", "number of pages", "total pages",
+]
+FILENAME_KEYWORDS = [
+    "파일명", "파일 이름", "파일이름",
+    "file name", "filename",
+]
+UPLOAD_DATE_KEYWORDS = [
+    "업로드 날짜", "업로드일", "언제 업로드", "업로드 시각", "업로드한 날짜",
+    "upload date", "uploaded on", "when uploaded", "when was this uploaded",
+]
+CHUNK_COUNT_KEYWORDS = [
+    "청크 수", "청크가 몇", "청크 개수",
+    "chunk count", "how many chunks", "number of chunks",
 ]
 
 
 def _wants_page_count(question: str) -> bool:
     lowered = question.lower()
     return any(keyword.lower() in lowered for keyword in PAGE_COUNT_KEYWORDS)
+
+
+def _wants_filename(question: str) -> bool:
+    lowered = question.lower()
+    return any(keyword.lower() in lowered for keyword in FILENAME_KEYWORDS)
+
+
+def _wants_upload_date(question: str) -> bool:
+    lowered = question.lower()
+    return any(keyword.lower() in lowered for keyword in UPLOAD_DATE_KEYWORDS)
+
+
+def _wants_chunk_count(question: str) -> bool:
+    lowered = question.lower()
+    return any(keyword.lower() in lowered for keyword in CHUNK_COUNT_KEYWORDS)
+
+
+# Ordered (predicate, label, per-pdf line formatter) list checked in
+# query_multi_pdf — first match wins, so a question matching more than one
+# category picks the first one configured here. Each formatter returns the
+# FULL display line for one PDF (not just the value) so e.g. the filename
+# case doesn't end up rendering "- name.pdf: name.pdf".
+_METADATA_SHORT_CIRCUITS: List[Tuple[Callable[[str], bool], str, Callable[[PDFMetadata], str]]] = [
+    (_wants_page_count, "페이지 수", lambda pdf: f"{pdf.name}: {pdf.page_count}페이지"),
+    (_wants_filename, "파일명", lambda pdf: pdf.name),
+    (_wants_upload_date, "업로드 날짜", lambda pdf: f"{pdf.name}: {pdf.upload_timestamp.strftime('%Y-%m-%d %H:%M')}"),
+    (_wants_chunk_count, "청크 수", lambda pdf: f"{pdf.name}: {pdf.doc_count}개 청크"),
+]
 
 
 # Detects an explicit page range/single page named in the question (e.g.
@@ -745,18 +786,20 @@ class RAGService:
 
         reasoning_steps.append(f"📚 Searching across {len(pdfs)} PDF(s): {', '.join([p.name for p in pdfs])}")
 
-        # Page-count questions are answered directly from stored metadata —
-        # see _wants_page_count's docstring for why the LLM can never get
-        # this right on its own.
-        if _wants_page_count(question):
-            reasoning_steps.append("📐 페이지 수 질문 감지 — 저장된 메타데이터에서 직접 답변 (LLM 호출 없음)")
-            answer = "\n".join(f"- {pdf.name}: {pdf.page_count}페이지" for pdf in pdfs)
-            sources = [
-                {"pdf_name": pdf.name, "pdf_id": pdf.pdf_id, "chunk_index": 0}
-                for pdf in pdfs
-            ]
-            reasoning_steps.append("✨ Answer generated successfully!")
-            return answer, sources, reasoning_steps
+        # Metadata questions (page count, filename, upload date, chunk count)
+        # are answered directly from stored PDFMetadata — see the comment
+        # above _METADATA_SHORT_CIRCUITS for why the LLM can never get these
+        # right on its own.
+        for predicate, label, formatter in _METADATA_SHORT_CIRCUITS:
+            if predicate(question):
+                reasoning_steps.append(f"📐 {label} 질문 감지 — 저장된 메타데이터에서 직접 답변 (LLM 호출 없음)")
+                answer = "\n".join(f"- {formatter(pdf)}" for pdf in pdfs)
+                sources = [
+                    {"pdf_name": pdf.name, "pdf_id": pdf.pdf_id, "chunk_index": 0}
+                    for pdf in pdfs
+                ]
+                reasoning_steps.append("✨ Answer generated successfully!")
+                return answer, sources, reasoning_steps
 
         # An explicit "중국어 도안을 한국어로 번역해줘"-style question narrows OCR to
         # just the named source+target languages for THIS query (re-OCR from the

@@ -81,17 +81,17 @@ result = col.get(include=['documents', 'metadatas'])
 
 ### 잔재 테이블 (코드에서 미사용, DB 파일에만 남아있음)
 
-⚠️ 아래 3개 테이블은 `src/api/database.py`에 SQLAlchemy 모델이 없고, 현재 코드 어디에서도 읽거나 쓰지 않는다. 물리적으로 `api.db` 안에 남아있을 뿐이다.
+⚠️ 아래 테이블은 `src/api/database.py`에 SQLAlchemy 모델이 없고, 현재 코드 어디에서도 읽거나 쓰지 않는다. 물리적으로 `api.db` 안에 남아있을 뿐이다.
 
-| 테이블 | 유래 | 비고 |
+| 테이블 | 유래 | 상태 |
 |---|---|---|
-| `analysis_results` | 미완성 OCR/번역 "analyze" 기능의 잔재 | `filename`, `original_text`, `translated_text`, `source_language`, `ocr_confidence`, `analyzed_at` 컬럼 |
-| `chat_sessions` | 2026-07-23 제거된 백엔드 채팅 기록 | `session_id`, `created_at`, `last_active` |
-| `messages` | 위와 동일 | `message_id`, `session_id`, `role`, `content`, `sources`(JSON), `timestamp` |
+| `analysis_results` | 미완성 OCR/번역 "analyze" 기능의 잔재 | ✅ 2026-07-23 `scripts/cleanup_orphans.py --apply`로 DROP됨 — 더 이상 존재하지 않음 |
+| `chat_sessions` | 2026-07-23 제거된 백엔드 채팅 기록 (`session_id`, `created_at`, `last_active`) | 아직 남아있음 — 스크립트 대상 아님(추가 가능) |
+| `messages` | 위와 동일 (`message_id`, `session_id`, `role`, `content`, `sources`(JSON), `timestamp`) | 아직 남아있음 — 스크립트 대상 아님(추가 가능) |
 
 `chat_sessions`/`messages`가 왜 만들어졌고 왜 제거됐는지(세션이 답변 생성에 전혀 반영되지 않는 완전 무상태 구조였고, 프론트가 매 질의마다 `session_id: null`을 보내 세션 경계 자체가 깨져 있었으며, 조회 엔드포인트를 리포지토리 어디서도 호출하지 않았다는 조사 결과)는 `.claude/CLAUDE.md`의 "알려진 문제점 및 개선 계획" 6번 항목 참조.
 
-`scripts/cleanup_orphans.py`는 현재 `analysis_results`와 고아 ChromaDB 컬렉션만 dry-run/정리 대상으로 다룬다 — `chat_sessions`/`messages`는 아직 스크립트 대상에 없음(추가 가능).
+`scripts/cleanup_orphans.py`는 고아 ChromaDB 컬렉션과 `analysis_results`를 dry-run/정리 대상으로 다룬다(2026-07-23 `--apply` 실행 완료 — 고아 컬렉션 3개 삭제, `analysis_results` DROP). `chat_sessions`/`messages`는 아직 스크립트 대상에 없음.
 
 ---
 

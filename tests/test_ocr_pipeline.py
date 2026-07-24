@@ -26,8 +26,11 @@ from src.api.services.rag_service import (
     _looks_duplicated,
     _looks_untranslated_output,
     _normalize_korean_counts,
+    _wants_chunk_count,
+    _wants_filename,
     _wants_page_count,
     _wants_raw_page_content,
+    _wants_upload_date,
     _wants_translation,
     _wants_verbatim_or_translation,
 )
@@ -380,6 +383,85 @@ def test_query_multi_pdf_answers_page_count_without_llm():
 
     assert "11페이지" in answer
     assert sources == [{"pdf_name": "test.pdf", "pdf_id": "pdf_1", "chunk_index": 0}]
+    assert any("메타데이터에서 직접 답변" in s for s in reasoning_steps)
+
+
+def test_wants_filename():
+    assert _wants_filename("이 파일 이름이 뭐야?") is True
+    assert _wants_filename("What's the filename of this document?") is True
+    assert _wants_filename("이 문서를 요약해줘") is False
+
+
+def test_wants_upload_date():
+    assert _wants_upload_date("이거 언제 업로드했어?") is True
+    assert _wants_upload_date("What's the upload date?") is True
+    assert _wants_upload_date("이 문서를 요약해줘") is False
+
+
+def test_wants_chunk_count():
+    assert _wants_chunk_count("청크 수가 몇 개야?") is True
+    assert _wants_chunk_count("How many chunks does this have?") is True
+    assert _wants_chunk_count("이 문서를 요약해줘") is False
+
+
+def test_query_multi_pdf_answers_filename_without_llm():
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    service = RAGService()
+    fake_pdf = SimpleNamespace(
+        name="knitting_pattern.pdf", pdf_id="pdf_1", page_count=11, doc_count=11,
+        upload_timestamp=datetime(2026, 7, 23, 10, 30),
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
+
+    answer, sources, reasoning_steps = service.query_multi_pdf(
+        question="이 파일 이름이 뭐야?", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
+    )
+
+    assert answer == "- knitting_pattern.pdf"
+    assert sources == [{"pdf_name": "knitting_pattern.pdf", "pdf_id": "pdf_1", "chunk_index": 0}]
+    assert any("메타데이터에서 직접 답변" in s for s in reasoning_steps)
+
+
+def test_query_multi_pdf_answers_upload_date_without_llm():
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    service = RAGService()
+    fake_pdf = SimpleNamespace(
+        name="test.pdf", pdf_id="pdf_1", page_count=11, doc_count=11,
+        upload_timestamp=datetime(2026, 7, 23, 10, 30),
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
+
+    answer, sources, reasoning_steps = service.query_multi_pdf(
+        question="이거 언제 업로드했어?", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
+    )
+
+    assert "2026-07-23 10:30" in answer
+    assert any("메타데이터에서 직접 답변" in s for s in reasoning_steps)
+
+
+def test_query_multi_pdf_answers_chunk_count_without_llm():
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    service = RAGService()
+    fake_pdf = SimpleNamespace(
+        name="test.pdf", pdf_id="pdf_1", page_count=11, doc_count=17,
+        upload_timestamp=datetime(2026, 7, 23, 10, 30),
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
+
+    answer, sources, reasoning_steps = service.query_multi_pdf(
+        question="청크 수가 몇 개야?", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
+    )
+
+    assert "17개 청크" in answer
     assert any("메타데이터에서 직접 답변" in s for s in reasoning_steps)
 
 

@@ -116,9 +116,8 @@ python run.py                # (선택) Streamlit
 
 ### LLM 우회 단축 경로 (서버 직접 응답)
 RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 주입되지 않으므로, 시스템이 이미 알고 있는 정보는 LLM에게 물어도 절대 맞출 수 없음. 그래서 아래 질문은 LLM 호출 없이 즉시 응답:
-- **페이지 수 질문** (`_wants_page_count`, "몇 페이지"/"page count" 등) → `PDFMetadata.page_count`에서 직접 답변
+- **메타데이터 질문** (`_METADATA_SHORT_CIRCUITS` — 페이지 수/파일명/업로드 날짜/청크 수, `_wants_page_count`/`_wants_filename`/`_wants_upload_date`/`_wants_chunk_count`) → `PDFMetadata`에서 직접 답변. `(키워드 감지 함수, 표시 라벨, PDF당 답변 줄 포맷터)` 튜플 리스트를 순서대로 검사해 첫 매치로 처리 — 새 메타데이터 질문 유형을 추가하려면 이 리스트에 튜플 하나만 추가하면 됨
 - **페이지 원문 조회** (`_detect_page_range` + `_wants_raw_page_content`, 예: "1~2페이지 내용 알려줘" — 번역/분석 키워드 없을 때) → 저장된 페이지 텍스트를 그대로 반환
-- 파일명/업로드일/청크 수 등 다른 메타데이터 질문은 아직 미구현 (개선 계획 참조)
 
 ### 페이지 범위 지정
 `_detect_page_range()`가 "1~2페이지", "1페이지부터 3페이지까지", "pages 2-4", "page 5" 등을 정규식으로 감지. 감지되면 (전체 문서 모드에 한해) `source_page` 기준으로 청크를 필터링하고, 재-OCR도 해당 페이지만 수행. 번역/분석 요청도 좁혀진 범위만 LLM에 전달.
@@ -202,13 +201,14 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
    - 조치: `TRANSLATION_LINE_INSTRUCTIONS`에 "숫자와 단위는 붙여서 표기(12코, 12개의 코 금지)" 규칙 추가 + `_normalize_korean_counts()` 결정적 후처리(정규식 `(\d+)\s*개의\s*코` → `\1코`, `query_multi_pdf`에서 번역 응답에 항상 적용)로 이중 안전망. ⚠️ 정규식에 트레일링 `\b`(단어 경계)를 넣으면 안 됨 — 한글 조사(와/를 등)가 코에 공백 없이 붙어 Python의 유니코드 인식 `\b`가 한글-한글 사이를 경계로 보지 않아 매칭이 조용히 실패함
 4. ✅ **(해결됨, 2026-07-23) 박제된 구버전 OCR 임베딩** — OCR 언어 수정 이전에 업로드된 PDF는 ChromaDB에 깨진 텍스트가 남아 있고, 번역 외 일반 질의는 이 텍스트를 그대로 씀
    - 조치(B안): "재-OCR 결과로 컬렉션 갱신" 기능 추가. `PDFService.refresh_ocr(pdf_id, db, ocr_language=None)` — 원본 파일을 `CJK_OCR_LANGUAGE`(`text_extractor.py`, `chi_sim+chi_tra+kor`)로 재-OCR하고 기존 컬렉션을 삭제 후 **같은 `collection_name`으로 재생성** (`pdf_id`/`collection_name` 불변, `doc_count`/`page_count`만 갱신). `POST /api/v1/pdfs/{pdf_id}/refresh-ocr` 엔드포인트로 노출, 웹 UI 사이드바에 PDF별 새로고침 아이콘(호버 시 노출) 추가. `doc_count != page_count`(원래 OCR 문서가 아님) 또는 원본 파일 없음이면 400, PDF 없음이면 404. `VectorStore.delete_collection_by_name()` 헬퍼 신설(기존 `delete_pdf`의 raw Chroma 생성 코드도 이걸로 정리) — 임의의 컬렉션명을 인스턴스 상태와 무관하게 삭제 가능
-5. 🔧 **(스크립트 준비됨, 2026-07-23) 저장소 잔재 정리** — ChromaDB 고아 컬렉션 3개(2026-07-23 기준: `pdf_632425175926842791`·`pdf_973033043484023512` 0청크, `pdf_7679892920309835191` 1청크 — 전부 `api.db`의 `pdfs` 테이블에 대응 행 없음), `api.db`의 미사용 `analysis_results` 테이블(2행, 코드 어디서도 참조 안 함), 레거시 `core/rag.py`·`core/llm.py`(+ `tests/test_rag.py`)
-   - 조치: `scripts/cleanup_orphans.py` 작성 — `api.db`의 `pdfs.collection_name`과 대조해 대응 행 없는 ChromaDB 컬렉션을 찾고, `analysis_results` 테이블 존재/행수 확인. 기본은 **dry-run**(보고만), `--apply`로 실제 삭제/DROP. 사용자가 직접 실행 여부 결정하기로 하고 아직 미실행(`--apply` 안 돌림) — 재실행 시 orphan 목록이 그 시점 기준으로 다시 계산되므로 위 3개 이름은 참고용
-   - 레거시 모듈(`core/rag.py`, `core/llm.py`, `tests/test_rag.py`)은 Streamlit 방향성 결정 전까지 보류 — 스크립트 범위 아님
+5. 🔶 **(부분 해결, 2026-07-23) 저장소 잔재 정리** — ChromaDB 고아 컬렉션, `api.db`의 미사용 `analysis_results` 테이블, 레거시 `core/rag.py`·`core/llm.py`(+ `tests/test_rag.py`)
+   - ✅ 조치: `scripts/cleanup_orphans.py` 작성 후 `--apply` 실행 완료 — 고아 ChromaDB 컬렉션 3개(`pdf_632425175926842791`·`pdf_973033043484023512` 0청크, `pdf_7679892920309835191` 1청크) 삭제, `analysis_results` 테이블 DROP. 남은 컬렉션은 `pdf_1884475783623626966`(11청크, 실제 사용 중인 PDF) 1개뿐임을 확인. `api.db`엔 아직 `chat_sessions`/`messages`(6번 항목에서 제거된 백엔드 채팅 기록의 물리 잔재) 테이블이 남아있음 — 스크립트는 현재 이 둘을 대상으로 다루지 않음(추가 가능)
+   - ⏸ 레거시 모듈(`core/rag.py`, `core/llm.py`, `tests/test_rag.py`)은 Streamlit 방향성 결정 전까지 보류 — 미해결
 6. ✅ **(해결됨, 2026-07-23) 채팅 기록 이중 저장** — 백엔드 `api.db`와 프론트 `chat.db`에 같은 대화가 따로 저장되어 동기화되지 않음
    - **조사 결과**: 두 시스템이 같은 역할을 두고 경쟁하는 게 아니었음 — `RAGService.query_multi_pdf()`는 `session_id`를 받지도 않아 세션 히스토리를 답변 생성에 전혀 반영하지 않았고(완전히 무상태·단일턴), 프론트는 `/api/v1/query` 호출 시 항상 `session_id: null`을 보내 백엔드가 **매 질의마다 새 UUID를 생성**(대화 1개 = 세션 여러 개로 쪼개짐, 세션 경계 자체가 깨져 있었음), `GET /sessions/{id}/messages`는 리포지토리 어디서도 호출된 적 없음(문서의 curl 예시가 유일한 참조). 즉 백엔드 쪽은 "제2의 채팅 기록"이 아니라 **아무도 안 읽는 write-only 로그**였음. 반대로 프론트 `chat.db`는 사이드바 히스토리·대화 재개·제목 생성·삭제까지 실제로 동작하는 유일한 진짜 채팅 기록. 두 DB는 같은 커밋(`782a296`, Next.js+FastAPI 동시 도입)에서 조율 없이 각자의 스캐폴딩(Vercel AI Chatbot 템플릿의 Drizzle 저장소 + 새 REST 레이어의 자체 로그)을 그대로 가져오면서 생긴 결과
    - **조치**: 백엔드의 `ChatSession`/`ChatMessage` 저장 경로를 전부 제거 — `src/api/database.py`(모델 클래스), `src/api/services/rag_service.py`(`save_message()`/`get_session_messages()`), `src/api/routers/query.py`(`GET /sessions/{id}/messages` 엔드포인트, 질의 전후 저장 호출), `src/api/models.py`(`QueryRequest.session_id`, `QueryResponse.session_id`/`message_id`), 프론트 `web-ui/lib/ai/provider.ts`(대응 필드), `docs/api/rest-api.md`. 백엔드는 이제 순수 질의응답 엔진, 프론트 `chat.db`가 유일한 채팅 기록. `api.db`의 물리 `chat_sessions`/`messages` 테이블과 기존 데이터는 `analysis_results`와 같은 성격의 잔재로 남겨둠(제거 안 함) — `scripts/cleanup_orphans.py` 대상에 나중에 포함 가능
-7. **서버 직접 응답 범위 확장** — 현재 페이지 수/페이지 원문만 LLM 우회. 파일명·업로드일·청크 수 등도 같은 패턴으로 확장 가능
+7. ✅ **(해결됨, 2026-07-23) 서버 직접 응답 범위 확장** — 기존엔 페이지 수/페이지 원문만 LLM 우회
+   - 조치: `_wants_page_count()`(기존)와 같은 패턴으로 `_wants_filename()`, `_wants_upload_date()`, `_wants_chunk_count()` 추가. `query_multi_pdf()`의 하드코딩된 단일 if문을 `_METADATA_SHORT_CIRCUITS`(예측 함수·라벨·포맷터 튜플 리스트) 순회 방식으로 리팩터링해 4개 유형을 코드 중복 없이 처리. 실제 API로 4가지 질문(페이지 수/파일명/업로드일/청크 수) 전부 LLM 호출 없이 정확히 응답하는 것을 확인
 8. **`needsDocumentContext()` 키워드 분류기(route.ts)가 조잡** — "this", "explain" 등 광범위한 영어 키워드라 일반 대화도 문서 질문으로 오분류 가능
 9. **pre-commit이 pytest 대신 unittest 실행** — CI(pytest)와 불일치. `.pre-commit-config.yaml`의 entry를 pytest로 교체 검토
 10. **API 응답에 기계판독용 `truncated` 플래그 없음** — 현재는 답변 텍스트의 ⚠️ 문구로만 표시. `metadata` dict에 boolean 추가하면 UI가 활용 가능
