@@ -46,4 +46,22 @@ class VectorStore:
                 self.vector_db = None
             except Exception as e:
                 logger.error(f"Error deleting collection: {e}")
-                raise 
+                raise
+
+    def delete_collection_by_name(self, collection_name: str) -> None:
+        """Delete a named ChromaDB collection regardless of whether it's this
+        instance's own self.vector_db — unlike delete_collection(), which only
+        operates on the last collection created via create_vector_db() on
+        this instance. Needed to delete/replace an arbitrary PDF's
+        collection (e.g. re-embedding after a re-OCR)."""
+        try:
+            logger.info(f"Deleting vector database collection: {collection_name}")
+            vector_db = Chroma(
+                persist_directory=self.persist_directory,
+                embedding_function=self.embeddings,
+                collection_name=collection_name,
+            )
+            vector_db.delete_collection()
+        except Exception as e:
+            logger.error(f"Error deleting collection {collection_name}: {e}")
+            raise 

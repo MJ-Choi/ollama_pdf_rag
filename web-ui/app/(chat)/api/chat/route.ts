@@ -11,7 +11,11 @@ import {
 import { ChatSDKError } from "@/lib/errors";
 import { generateUUID } from "@/lib/utils";
 
-export const maxDuration = 60;
+// Only enforced on Vercel deployments (no effect on local `next dev`). A
+// full-document translation walks the PDF page by page on the backend and
+// can take well past 60s — raised so a Vercel deployment doesn't kill the
+// function mid-translation. Actual ceiling depends on the Vercel plan tier.
+export const maxDuration = 1800;
 
 interface MessagePart {
   type: string;
@@ -160,7 +164,9 @@ It looks like your question might be about a document, but you haven't selected 
       };
     } else if (useRAG) {
       // Use RAG with selected PDFs
+      const reqDtm = new Date().toISOString().slice(0, 19).replace("T", " ");
       console.log("Sending to backend:", {
+        reqDtm,
         question: textContent,
         model: selectedChatModel,
         pdfIds: selectedPdfIds,

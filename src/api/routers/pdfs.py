@@ -64,3 +64,29 @@ def delete_pdf(
     if not success:
         raise HTTPException(status_code=404, detail="PDF not found")
     return {"message": "PDF deleted successfully"}
+
+
+@router.post("/{pdf_id}/refresh-ocr", response_model=PDFUploadResponse)
+def refresh_pdf_ocr(
+    pdf_id: str,
+    db: Session = Depends(get_db),
+    pdf_service: PDFService = Depends(get_pdf_service)
+):
+    """Re-OCR a PDF's original file and replace its stored embeddings —
+    for PDFs uploaded before an OCR quality/language fix, whose embedded
+    text is otherwise stale forever (upload-time OCR is a one-time snapshot)."""
+    try:
+        pdf_metadata = pdf_service.refresh_ocr(pdf_id, db)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return PDFUploadResponse(
+        pdf_id=pdf_metadata.pdf_id,
+        name=pdf_metadata.name,
+        collection_name=pdf_metadata.collection_name,
+        doc_count=pdf_metadata.doc_count,
+        page_count=pdf_metadata.page_count,
+        upload_timestamp=pdf_metadata.upload_timestamp
+    )

@@ -1,227 +1,210 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+이 문서는 Claude Code(claude.ai/code)가 이 저장소에서 작업할 때 참고하는 가이드입니다.
 
 ## 절대규칙
 - 클로드는 환경변수 파일(.env*)을 건들지 않는다
 - 답변은 한국어로만 한다
 - Frontend: @web-ui/claude.md
 
-## Project Overview
+## 프로젝트 개요
 
-A full-stack local RAG (Retrieval Augmented Generation) application for chatting with PDF documents using Ollama and LangChain. The project consists of:
-- **Python Backend**: FastAPI REST API with RAG pipeline, PDF processing, and ChromaDB vector storage
-- **Next.js Frontend**: Modern React UI with chat persistence, PDF management, and model selection
-- **Streamlit App**: Alternative UI for experimentation (legacy)
+Ollama와 LangChain을 사용해 PDF 문서와 대화하는 완전 로컬 RAG(검색 증강 생성) 애플리케이션.
+- **Python 백엔드**: FastAPI REST API — RAG 파이프라인, PDF/OCR 처리, ChromaDB 벡터 저장
+- **Next.js 프론트엔드**: 채팅 영속화, PDF 관리, 모델 선택 UI
+- **Streamlit 앱**: 실험용 보조 UI (레거시, 독립 동작)
 
-## Architecture
+주 사용 사례: 스캔된 중국어 뜨개질 도안 PDF를 OCR로 읽어 한국어로 번역/질의.
 
-### Backend (Python)
+## 아키텍처
 
-**Core Components**:
-- `src/core/rag.py`: RAG pipeline using LangChain's MultiQueryRetriever and prompt chains
-- `src/core/llm.py`: LLM configuration and prompt management via OllamaLLM
-- `src/core/embeddings.py`: Vector embeddings via OllamaEmbeddings with ChromaDB storage
-- `src/core/document.py`: PDF text/OCR loading and chunking. `DocumentProcessor.load_pdf()` returns `(documents, used_ocr)` — auto-detects scanned/image-based PDFs via `detect_if_image_based()` (text length, CJK-aware garbled-text ratio, single-char-word ratio) and falls back to OCR when native `UnstructuredPDFLoader` extraction is too poor
-- `src/core/text_extractor.py`: OCR extraction for scanned/image-based PDFs via `pytesseract` + `pdf2image` (300 DPI, default OCR language `eng+chi_sim+chi_tra+kor`, optional deps that degrade gracefully if missing); collapses spurious spacing Tesseract inserts between CJK characters
-- `src/core/image_handler.py`: Image preprocessing for OCR — auto-rotate, denoise, grayscale, and **watermark removal** (`remove_watermark()`, OpenCV Otsu binarization that strips light-gray tiled/ghosted watermarks while preserving ink strokes)
-- `src/core/image_analysis.py`: `pytesseract` OCR wrapper (text + text boxes), image quality metrics (blur/brightness/contrast via OpenCV Laplacian), language detection (`langdetect`)
+### 백엔드 (Python)
 
-**API Layer** (`src/api/`):
-- `main.py`: FastAPI app setup with CORS middleware (allows localhost:3000 for Next.js); registers `pdfs`, `query`, `models`, `health` routers
-- `database.py`: SQLite with SQLAlchemy models (PDFMetadata, ChatSession, ChatMessage)
-- `routers/`: pdfs (upload/delete), query (RAG), models, health (status)
-- `services/`: Business logic — `pdf_service.py`, `rag_service.py`
-- `config.py`: Settings for Ollama connection (default: http://localhost:11434)
+**핵심 모듈 (`src/core/`)**:
+- `document.py`: PDF 텍스트/OCR 로딩과 청크화. `DocumentProcessor.load_pdf()`가 `(documents, used_ocr)`를 반환 — `detect_if_image_based()`(텍스트 길이, CJK 인식 깨짐 비율, 단일문자 단어 비율)로 스캔 문서를 자동 감지하고, 네이티브 추출(`UnstructuredPDFLoader`)이 부실하면 OCR로 폴백
+- `text_extractor.py`: `pytesseract` + `pdf2image` 기반 OCR (300 DPI, 기본 언어 `eng+chi_sim+chi_tra+kor`, `start_page`/`end_page`로 페이지 범위 지정 가능). CJK 문자 사이 불필요한 공백 제거, **반복 워터마크/캡션 줄 제거**(`_strip_recurring_watermark_lines` — 페이지 상단 3줄만 후보로, 퍼지 클러스터링으로 전체 페이지 60% 이상에서 반복되는 줄만 제거)
+- `image_handler.py`: OCR 전처리 — 자동 회전, 노이즈 제거, 그레이스케일, **이미지 수준 워터마크 제거**(`remove_watermark()`, OpenCV Otsu 이진화로 연한 회색 워터마크 제거)
+- `image_analysis.py`: `pytesseract` 래퍼(텍스트 + 텍스트 박스), 이미지 품질 지표(블러/밝기/대비), 언어 감지(`langdetect`)
+- `embeddings.py`: `VectorStore` — OllamaEmbeddings(`nomic-embed-text`) + ChromaDB 저장. API와 Streamlit 양쪽에서 사용
+- ⚠️ `rag.py`(`RAGPipeline`)와 `llm.py`(`LLMManager`)는 **레거시** — 실제 서빙 경로(FastAPI/Streamlit) 어디서도 사용하지 않고 `tests/test_rag.py`만 참조. 실제 RAG 로직은 `src/api/services/rag_service.py`에 인라인으로 구현되어 있음
 
-**Key Flow**:
-1. User uploads PDF → text extracted (OCR + watermark removal fallback for scanned PDFs) → chunked → stored in ChromaDB
-2. Query arrives → MultiQueryRetriever generates variations → retrieves relevant chunks → priority reference context from `data/context/*.json` injected into the prompt → LLM synthesizes response with sources
+**API 계층 (`src/api/`)**:
+- `main.py`: FastAPI 앱 설정. CORS는 `http://localhost:3000`(Next.js)만 허용. `pdfs`, `query`, `models`, `health` 라우터 등록
+- `database.py`: SQLite(`data/api.db`) + SQLAlchemy 모델 3개 — `PDFMetadata`(pdfs), `ChatSession`(chat_sessions), `ChatMessage`(messages). ⚠️ 라이브 DB에 `analysis_results` 테이블이 있으나 이는 미완성 analyze 기능의 잔재로, 현재 코드 어디에도 모델/사용처가 없음
+- `routers/`: `pdfs`(업로드/목록/삭제), `query`(RAG 질의 + 세션 메시지 조회), `models`(Ollama 모델 목록), `health`
+- `services/`: `pdf_service.py`(업로드→OCR→청크→임베딩), `rag_service.py`(질의 오케스트레이션 — 이 파일이 사실상 RAG의 전부)
+- `config.py`: Ollama 연결 설정 (기본 http://localhost:11434)
 
+**질의 처리 흐름** (`RAGService.query_multi_pdf`):
+1. PDF 메타데이터 조회 → **서버가 직접 답할 수 있는 질문이면 LLM 호출 없이 즉시 반환** (아래 "LLM 우회 단축 경로" 참조)
+2. 번역 의도 감지 시 → 원본 PDF를 좁힌 언어팩으로 재-OCR (페이지 범위 지정 시 해당 페이지만)
+3. 전체 청크 40개 이하면 전체 문서 컨텍스트, 초과 시 MultiQueryRetriever 유사도 검색
+4. 페이지 범위가 질문에 있으면 `source_page` 기준으로 청크 필터링
+5. `data/context/*.json` 우선참조 컨텍스트를 프롬프트에 주입
+6. 다중 페이지 번역이면 페이지별 루프, 아니면 단일 호출 → 답변 + 출처 반환
 
-### Data Storage
+### 데이터 저장
 
-- **Vector DB**: ChromaDB (persisted to `data/vectors/`)
-- **PDFs**: Stored in `data/pdfs/` directory
-- **API Database**: SQLite at `data/api.db`
-- **Frontend Database**: Drizzle ORM (configurable backend)
+- **벡터 DB**: ChromaDB (`data/vectors/`) — PDF 1개당 컬렉션 1개(`collection_name`), OCR 텍스트가 페이지 단위 청크로 저장(`source_page` 메타데이터 포함). ⚠️ **업로드 시점의 OCR 결과가 박제됨** — 질의 시점 재-OCR 결과는 여기 반영되지 않음(재업로드해야 갱신)
+- **원본 PDF**: `data/pdfs/uploads/` (`{pdf_id}_{파일명}`) — 재-OCR이 읽는 원본
+- **API DB**: SQLite `data/api.db` — PDF 메타데이터, 백엔드 채팅 기록
+- **프론트엔드 DB**: `web-ui/data/chat.db` (Drizzle ORM + better-sqlite3) — 프론트 채팅 기록 (백엔드와 이중 저장됨)
 
-## Common Development Commands
+## 개발 명령어
 
-### Python Backend
+### Python 백엔드
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
 
-# Run FastAPI server (on port 8001)
+# FastAPI 서버 (포트 8001)
 python run_api.py
 
-# Run tests
+# 테스트
 python -m pytest tests/ -v
 python -m pytest tests/ --cov=src
+python -m pytest tests/test_ocr_pipeline.py -v          # 단일 파일
+python -m pytest tests/test_rag.py::test_specific_case  # 단일 테스트
 
-# Run a single test file / test
-python -m pytest tests/test_rag.py -v
-python -m pytest tests/test_rag.py::test_specific_case -v
-
-# Pre-commit hooks (runs `unittest discover tests` + `pylint` on staged Python files)
+# pre-commit (주의: pytest가 아니라 `unittest discover tests` + pylint를 실행함)
 pre-commit install
 pre-commit run --all-files
 ```
 
-Note: pre-commit actually runs `python -m unittest discover tests`, not pytest, and there is no `pytest.ini`/`pyproject.toml` at root configuring pytest — `python -m pytest tests/` works via pytest defaults but isn't what pre-commit enforces.
+루트에 `pytest.ini`/`pyproject.toml` 없음 — pytest는 기본값으로 동작. CI(`.github/workflows/tests.yml`)는 Python 3.10~3.12 매트릭스로 `pytest --cov` 실행.
 
-### Frontend (web-ui)
+### 프론트엔드 (web-ui)
 
 ```bash
 cd web-ui
 pnpm install
 
-# Dev server (Next.js, port 3000)
-pnpm dev
+pnpm dev           # 개발 서버 (포트 3000, Turbopack)
+pnpm build         # 프로덕션 빌드 (lib/db/migrate 선실행)
+pnpm lint          # Ultracite/Biome 검사
+pnpm format        # 자동 수정
 
-# Production build (runs `tsx lib/db/migrate` first, then `next build`)
-pnpm build
+pnpm db:generate   # 마이그레이션 파일 생성
+pnpm db:migrate    # 마이그레이션 적용 (빈 DB에서도 동작)
+pnpm db:push       # 스키마 직접 반영 (마이그레이션 파일 없이, 로컬 빠른 반복용)
+pnpm db:studio     # Drizzle Studio
 
-# Lint / format (Ultracite/Biome, see below)
-pnpm lint
-pnpm format
-
-# Drizzle schema management
-pnpm db:generate   # create a migration file
-pnpm db:push       # push schema directly (no migration file; handy for quick local iteration)
-pnpm db:studio     # inspect DB in Drizzle Studio
-
-# Playwright e2e tests
-pnpm test
+pnpm test          # Playwright e2e
 ```
 
-Frontend TS/TSX/JS/JSX code is governed by an always-applied Cursor rule (`web-ui/.cursor/rules/ultracite.mdc`) wrapping Ultracite/Biome — covers accessibility, complexity, correctness, TypeScript, style, Next.js, and testing conventions. `pnpm lint` checks, `pnpm format` auto-fixes.
+TS/TSX 코드는 `web-ui/.cursor/rules/ultracite.mdc`(Ultracite/Biome 규칙)의 적용을 받음.
 
-### Running Everything
+### 전체 실행
 
 ```bash
-# Start all services (Terminal 1: Backend, Terminal 2: Frontend)
-./start_all.sh
-
-# Or manually:
-# Terminal 1
-python run_api.py
-
-# Terminal 2
-cd web-ui && pnpm dev
+./start_all.sh   # FastAPI(8001) + Next.js(3000) + Streamlit(8501) 동시 기동
+# 또는 개별 실행:
+python run_api.py            # 터미널 1
+cd web-ui && pnpm dev        # 터미널 2
+python run.py                # (선택) Streamlit
 ```
 
-## Architecture Decisions & Key Patterns
+## 아키텍처 결정 및 핵심 패턴
 
-### RAG Pipeline
-- Uses **MultiQueryRetriever** to generate multiple query variations before retrieval, improving recall
-- Chunks are 7500 characters with 100-character overlap (`DocumentProcessor(chunk_size=7500, chunk_overlap=100)` in `pdf_service.py`)
-- ChromaDB provides exact cosine similarity matching
-- All processing is local—no data leaves the machine
+### RAG 파이프라인
+- 청크: 7,500자 / 겹침 100자 (`DocumentProcessor(chunk_size=7500, chunk_overlap=100)` — `pdf_service.py`)
+- 전체 청크 40개 이하(`FULL_CONTEXT_CHUNK_LIMIT`)면 유사도 검색을 건너뛰고 **문서 전체를 컨텍스트로 사용** — 소규모 문서에서 "전부 추출해줘" 류 요청이 검색 누락으로 깨지는 것을 방지
+- 대규모일 때만 MultiQueryRetriever(질의 변형 2개 생성) + top-k 검색
+- 모든 처리는 로컬 — 데이터가 기기를 떠나지 않음
 
-### Answer generation: truncation safety net & per-page translation loop
-- `RAGService.query_multi_pdf()` sizes `num_ctx` per-call via `_estimate_num_ctx()`, but a single flat output budget isn't enough for a full-document line-by-line translation (e.g. "이 중국어 도안을 한국어로 번역해줘" across an 11-page PDF) — the model would silently get cut off mid-answer, with Ollama's `done_reason` never checked.
-- Every generation call now goes through `RAGService._invoke_with_continuation()` (LangChain `ChatOllama` path) or `_invoke_ollama_chat_with_continuation()` (raw-`ollama` thinking-model path): if `done_reason != "stop"`, it retries up to `MAX_CONTINUATION_ATTEMPTS` times asking the model to continue from where it left off, and appends a visible `⚠️` warning to the answer text itself if still incomplete after retries — never silently reports `"✨ Answer generated successfully!"` on a truncated response.
-- `_wants_verbatim_or_translation()` (verbatim keywords OR `TRANSLATION_INTENT_KEYWORDS`) gates: (1) disabling thinking mode (`reasoning=False` / `think=True` skipped) since chain-of-thought reasoning burns output budget with no value for mechanical transcription, and (2) `RAGService._translate_pages()` — when full-document context has more than one page, translate/reproduce one page per LLM call (bounded per-call output, `PAGE_TRANSLATION_OUTPUT_BUDGET`) instead of one giant call for the whole document, then concatenate in order. Slower (up to one Ollama call per page) but actually completes instead of guessing a big-enough single budget.
-- `_translate_pages()` is resilient per page, not all-or-nothing: a HARD failure (e.g. Ollama itself crashing mid-generation — observed "unexpected EOF") is retried up to `MAX_PAGE_RETRY_ATTEMPTS` times with a short backoff; if a page still fails, it's recorded in `failed_pages` and marked inline in the output, but every OTHER page's already-completed translation is kept and returned rather than the whole request raising and losing everything (previously an uncaught exception anywhere in the loop discarded all prior pages' work — see `query.py`'s generic `except Exception` → HTTP 500 with nothing saved).
-- Translation-mode pages are also validated structurally after generation via `_looks_correctly_interleaved()` (rejects the model dumping all original lines then all translations as two separate blocks, or skipping translation entirely) and `_looks_duplicated()` (rejects a page's content — or even just a repeated line/header snippet — being generated twice in one response); either failure retries the same page (same `MAX_PAGE_RETRY_ATTEMPTS` budget, with a corrective follow-up message), and if still unresolved after retries the result is kept anyway (flagged, not discarded) rather than treated as a hard failure. `TRANSLATION_LINE_INSTRUCTIONS` includes a concrete few-shot example of the required original-then-translation interleaving to reduce how often this retry path is needed in the first place.
+### LLM 우회 단축 경로 (서버 직접 응답)
+RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 주입되지 않으므로, 시스템이 이미 알고 있는 정보는 LLM에게 물어도 절대 맞출 수 없음. 그래서 아래 질문은 LLM 호출 없이 즉시 응답:
+- **페이지 수 질문** (`_wants_page_count`, "몇 페이지"/"page count" 등) → `PDFMetadata.page_count`에서 직접 답변
+- **페이지 원문 조회** (`_detect_page_range` + `_wants_raw_page_content`, 예: "1~2페이지 내용 알려줘" — 번역/분석 키워드 없을 때) → 저장된 페이지 텍스트를 그대로 반환
+- 파일명/업로드일/청크 수 등 다른 메타데이터 질문은 아직 미구현 (개선 계획 참조)
 
-### API Design
-- RESTful with `/api/v1/` prefix
-- CORS allows only localhost:3000 (configured in `src/api/main.py`)
-- Responses include source citations and metadata
-- Health endpoint at `/api/v1/health`
+### 페이지 범위 지정
+`_detect_page_range()`가 "1~2페이지", "1페이지부터 3페이지까지", "pages 2-4", "page 5" 등을 정규식으로 감지. 감지되면 (전체 문서 모드에 한해) `source_page` 기준으로 청크를 필터링하고, 재-OCR도 해당 페이지만 수행. 번역/분석 요청도 좁혀진 범위만 LLM에 전달.
 
-### Frontend State
-- Chats are persisted to the database via Drizzle ORM
-- Each chat can be associated with specific PDFs
-- Streaming responses via Vercel's AI SDK
-- Real-time chat history updates
+### 답변 생성: 잘림 방지 + 페이지별 번역 루프
+- 모든 생성 호출은 `_invoke_with_continuation()`(ChatOllama) 또는 `_invoke_ollama_chat_with_continuation()`(raw ollama, 씽킹 모델)을 거침 — Ollama의 `done_reason != "stop"`이면 최대 `MAX_CONTINUATION_ATTEMPTS`(2)회 이어쓰기 재시도, 그래도 미완이면 답변 텍스트에 ⚠️ 경고를 명시 (잘린 답변을 조용히 성공 처리하지 않음)
+- `_wants_verbatim_or_translation()`(verbatim 키워드 또는 번역 키워드)이 참이면: (1) 씽킹 모드 비활성화(기계적 전사에 사고과정은 출력 예산 낭비), (2) 다중 페이지면 `_translate_pages()` — **페이지당 LLM 1회 호출**로 나눠 순서대로 이어붙임 (단일 대형 호출의 출력 한도 초과로 인한 잘림을 구조적으로 방지)
+- `_translate_pages()`는 페이지 단위로 격리됨: 하드 실패(Ollama 크래시 등)는 `MAX_PAGE_RETRY_ATTEMPTS`(2)회 재시도 후에도 실패하면 그 페이지만 실패 표시하고 계속 진행 — 완료된 페이지는 절대 유실되지 않음
+- 번역 페이지는 생성 후 구조 검증: `_looks_correctly_interleaved()`(원문/번역 블록 분리 또는 번역 누락 감지), `_looks_duplicated()`(중복 생성 감지 — 인접 블록 반복을 크기 1줄부터 스캔, **한글 줄이 포함된 중복만 플래그** — 번역 불가 OCR 잡음 줄이 원문/번역 자리에 똑같이 복사되는 정상 케이스는 재시도 낭비 없이 통과), `_looks_untranslated_output()`(타깃이 한국어인데 한글 비율 15% 미만이면 오역/미번역으로 간주 — 마지막 페이지 영어 드리프트 방지). 실패 시 교정 메시지와 함께 재시도, 소진 시 결과는 유지하고 플래그만
+- 번역 응답에는 `_normalize_korean_counts()` 후처리를 항상 적용 — "12개의 코" → "12코" (모델이 지시문을 따르지 않아도 결정적으로 보정)
 
-### Environment & Configuration
-- Backend connects to Ollama at `http://localhost:11434` (configurable in `src/api/config.py`)
-- Frontend talks to backend at `http://localhost:8001/api/v1`
-- SQLite for local API database (no external dependencies)
-- Optional: PostgreSQL support for frontend via Drizzle
+### OCR과 워터마크 제거 (스캔 PDF)
+- 업로드: `UnstructuredPDFLoader(strategy="fast")` → `detect_if_image_based()` 판정 → OCR 폴백 (`pdf2image` 300 DPI → 전처리(Otsu 이진화 포함) → `pytesseract --psm 6` → CJK 공백 정리 → 반복 워터마크 줄 제거 → 페이지 단위 Document)
+- `PDFService.upload_and_process()`는 `used_ocr=True`면 재청크를 건너뜀 (OCR 경로가 이미 페이지 청크를 반환)
+- 튜닝 지점: `text_extractor.DEFAULT_OCR_LANGUAGE`, `DEFAULT_DPI`, `document.MIN_TEXT_LENGTH` 등 감지 임계값, `text_extractor._WATERMARK_*` 상수
+- 시스템 `tesseract` 바이너리 + 언어팩(`chi_sim`/`chi_tra`/`kor`) 필수 — Python 패키지만으로 부족
 
-### OCR & Watermark Removal (scanned PDFs)
-- `DocumentProcessor.load_pdf()` loads via `UnstructuredPDFLoader(strategy="fast")` first, then `detect_if_image_based()` decides whether the extracted text is real or garbage (too short / CJK-aware garbled-character ratio / single-char-word ratio)
-- OCR path: `pdf2image` renders pages at 300 DPI → `ImageHandler.preprocess_for_ocr()` (auto-rotate, denoise, grayscale, then **Otsu binarization to strip light-gray watermarks**) → `pytesseract` (`eng+chi_sim+chi_tra+kor`, `--psm 6`) → CJK inter-character spacing cleanup → page-level `Document` chunks
-- `PDFService.upload_and_process()` skips re-chunking when `used_ocr=True` since the OCR path already returns page-chunked documents
-- Tuning knobs: OCR language list (`text_extractor.DEFAULT_OCR_LANGUAGE`), DPI (`text_extractor.DEFAULT_DPI`), detection thresholds (`document.MIN_TEXT_LENGTH`, `MEANINGFUL_RATIO_THRESHOLD`, `SPECIAL_RATIO_THRESHOLD`, `SINGLE_CHAR_WORD_RATIO_THRESHOLD`)
-- Requires the system `tesseract` binary with the needed language packs (`chi_sim`, `chi_tra`, `kor`) installed — the Python packages alone aren't sufficient
-- **Query-time OCR language override**: mixing `eng` into Tesseract's language set measurably degrades CJK recognition (e.g. `下针` misread as `FH, Get,`), but dropping `eng` from the default risks English-only scans. `RAGService._detect_ocr_language_override()` (`rag_service.py`) instead narrows the OCR language *per query*: when the question names an explicit source+target translation pair (e.g. "중국어 도안을 한국어로 번역해줘" → `chi_sim+chi_tra+kor`, no `eng`), `RAGService._reocr_pdf_chunks()` re-runs OCR on that PDF's original file with the narrowed language set for that query only — the stored ChromaDB collection is untouched. Only applies in full-document-context mode (`doc_count == page_count`, i.e. the PDF was originally OCR'd); large/retrieval-mode queries and PDFs without a resolvable `file_path` fall back to the stored chunks unchanged.
-- **Recurring watermark/caption removal**: `text_extractor._strip_recurring_watermark_lines()` runs after all pages are OCR'd in `extract_text_from_scanned_pdf()`, removing a caption that OCR picks up near the top of most/all pages (e.g. a "do not resell, follow our shop" line stamped on every page of a scanned pattern) before it ever reaches chunking/translation. Only the first `_WATERMARK_HEADER_LINES_TO_CHECK` non-empty lines of each page are eligible candidates (never mid-page content, so a legitimately repeated short instruction like `全下针` is never at risk); candidates are fuzzy-clustered (`difflib.SequenceMatcher`, any-linkage so a chain of drifting OCR variants still merges, edge-trimmed to `[A-Za-z一-鿿㐀-䶿가-힣]` before comparing since OCR pads watermark lines with inconsistent junk characters that otherwise dilute the match) and a cluster is only stripped if it covers `_WATERMARK_PAGE_COVERAGE` of all pages — low-confidence/rarely-OCR'd variants are deliberately left alone rather than risking a false removal.
+### 질의 시점 OCR 언어 좁히기 (재-OCR)
+- Tesseract 언어팩에 `eng`이 섞이면 CJK 인식률이 실측으로 하락 (예: `下针` → `FH, Get,` 오인식). 그래서 기본값에서 `eng`을 빼는 대신 **질의별로** 좁힘
+- `_detect_ocr_language_override()`: **번역 의도만 있으면** 트리거 — 소스+타깃 언어를 둘 다 명시하면 그 조합("중국어→한국어" → `chi_sim+chi_tra+kor`), 언어명이 0~1개면 CJK 기본값(`_DEFAULT_TRANSLATION_OCR_LANGUAGE = chi_sim+chi_tra+kor`)으로 폴백
+- `_reocr_pdf_chunks()`: 원본 파일을 좁힌 언어팩으로 재-OCR (페이지 범위 지정 가능). **결과는 그 질의에만 사용, ChromaDB에는 저장 안 함**. 전체 문서 모드 + `doc_count == page_count`(OCR로 처리된 문서)일 때만
 
-### Priority Reference Context (`data/context/`)
-- `data/context/` is a general-purpose store for **any** `*.json` file the user wants the model to treat as authoritative and consult BEFORE its own built-in knowledge — not limited to translation. Term glossaries (`chi_knitting.json`), rule sheets, domain facts, style guides, etc. can all live here side by side
-- Two shapes are supported per file (`RAGService._load_priority_context()` in `src/api/services/rag_service.py`):
-  - A flat `{"key": "value"}` string dict is rendered as a `key → value` lookup list (glossary style)
-  - Any other JSON shape (nested objects, lists, ...) is pretty-printed as-is under a heading with the filename
-- `RAGService` reloads **every** `*.json` file in the directory on each query (no server restart needed after adding/editing files) and injects the combined result into both the standard prompt and the thinking-model (qwen3/deepseek) system message, instructing the LLM to prefer this context over its own knowledge/assumptions
-- Files are never merged together — each is kept as its own `[filename.json]`-labeled section, listed in alphabetical filename order
+### 우선참조 컨텍스트 (`data/context/`)
+- 모델이 자체 지식보다 **먼저** 참조해야 하는 모든 `*.json` 파일의 범용 저장소 — 용어집(`chi_knitting.json`), 규칙, 도메인 지식 등
+- 파일 형태 2가지 (`RAGService._load_priority_context()`): 평면 `{"키": "값"}` 문자열 딕셔너리는 `키 → 값` 목록으로, 그 외 JSON은 파일명 헤더 아래 pretty-print
+- **매 질의마다 전체 파일을 다시 로드** — 파일 추가/수정 후 서버 재시작 불필요
+- ⚠️ **프롬프트 예시(few-shot)가 용어집을 이길 수 있음**: `TRANSLATION_LINE_INSTRUCTIONS`의 형식 예시에 실제 도메인 용어를 쓰면 모델이 용어집 대신 예시 표현을 따라감 (실제 발생했던 버그 — "下针→아래뜨기" 예시가 용어집의 "下针→K"를 눌렀음). 예시는 반드시 `[source line A]` 같은 플레이스홀더만 사용
+- 복합어와 단독 글자 매핑이 겹칠 때(예: `下针→K`와 `针→코`)는 지시문이 "각 매핑을 해당 원문에만 문자 그대로 적용"하도록 명시되어 있음 (`[12针]` → `[12코]`, `[12개의 K]` 아님)
 
-## Important Files & Their Purposes
+## 주요 파일
 
-**Backend**:
-- `src/core/rag.py` — RAG pipeline orchestration
-- `src/core/document.py`, `text_extractor.py`, `image_handler.py`, `image_analysis.py` — PDF text extraction, OCR fallback, watermark removal
-- `src/api/routers/query.py` — Query endpoint that drives RAG
-- `src/api/routers/pdfs.py` — PDF upload/deletion/listing
-- `src/api/services/rag_service.py` — RAG query orchestration + `data/context/` priority-context injection
-- `src/api/database.py` — SQLAlchemy models for metadata
-- `data/context/*.json` — priority reference context (glossaries, rules, domain facts, ...) — see Priority Reference Context above
+**백엔드**:
+- `src/api/services/rag_service.py` — **RAG의 핵심.** 질의 오케스트레이션, LLM 우회 단축 경로, 재-OCR, 페이지별 번역 루프, 잘림/형식 안전망, 우선참조 컨텍스트 주입 전부 여기
+- `src/core/document.py`, `text_extractor.py`, `image_handler.py`, `image_analysis.py` — PDF 텍스트 추출, OCR 폴백, 워터마크 제거
+- `src/api/routers/query.py`, `pdfs.py` — 질의/PDF 엔드포인트 (`pdfs.py`에 `POST /{pdf_id}/refresh-ocr` — 컬렉션 재-OCR 갱신)
+- `src/api/services/pdf_service.py` — 업로드/삭제/재-OCR 갱신(`refresh_ocr`)
+- `src/api/database.py` — SQLAlchemy 모델
+- `data/context/*.json` — 우선참조 컨텍스트
 
-**Config**:
-- `requirements.txt` — Python dependencies (LangChain 1.0.0, ChromaDB, FastAPI, Streamlit, `pytesseract`/`pdf2image`/`opencv-python-headless`/`langdetect` for OCR)
-- `web-ui/package.json` — Node dependencies (Next.js 16, Vercel AI SDK, Drizzle, Radix UI)
-- `run_api.py` — FastAPI entry point with uvicorn config
+**프론트엔드**:
+- `web-ui/lib/ai/provider.ts` — FastAPI 백엔드 직접 호출 (`ollamaChat` 등). `/api/v1/query`에는 30분 undici Agent 타임아웃 적용 (전체 문서 번역은 수십 분 걸릴 수 있음 — 기본 5분 타임아웃이면 `UND_ERR_HEADERS_TIMEOUT` 발생)
+- `web-ui/app/(chat)/api/chat/route.ts` — 채팅 API 라우트 (`maxDuration = 1800`)
+- `web-ui/components/elements/response.tsx` — 메시지 마크다운 렌더러. `remark-breaks` 적용됨 (단일 `\n` 줄바꿈 유지 — 백엔드가 보내는 줄 단위 번역/원문에 필수)
 
-## Development Workflow
+**설정**:
+- `requirements.txt` — LangChain 1.0 스택, OCR 의존성(`pytesseract`/`pdf2image`/`opencv-python-headless`/`langdetect`)
+- `run_api.py` — uvicorn 엔트리포인트 (reload=True)
 
-1. **Adding API Endpoints**:
-   - Create router in `src/api/routers/`
-   - Add to imports in `src/api/main.py`
-   - Update CORS if cross-origin access needed
-   - Test with curl or Swagger UI at `http://localhost:8001/docs`
+## 개발 워크플로
 
-2. **Modifying RAG Behavior**:
-   - Edit prompt templates in `src/core/llm.py`
-   - Adjust chunk size/overlap in `src/core/document.py`
-   - Modify retriever settings in `src/core/rag.py`
-   - Test with existing PDFs in ChromaDB
+1. **API 엔드포인트 추가**: `src/api/routers/`에 라우터 생성 → `main.py`에 등록 → 필요 시 CORS 갱신 → `http://localhost:8001/docs`에서 확인
+2. **RAG 동작 수정**: `rag_service.py`가 유일한 실경로 (core/rag.py 아님). 프롬프트/지시문 상수도 이 파일 상단에 모여 있음
+3. **프론트 DB 스키마 변경**: `pnpm db:generate` → `pnpm db:migrate` (빈 DB에서도 동작), 빠른 반복은 `pnpm db:push`
+4. **우선참조 컨텍스트 추가**: `data/context/`에 JSON 파일 추가/수정 — 재시작 불필요
+5. **OCR/RAG 변경 검증**: 유닛테스트만으로 불충분 — **반드시 실제 백엔드 + 실제 PDF + 실제 Ollama 모델로 end-to-end 확인** (샘플: `data/pdfs/uploads/pdf_1326292550554632241_대바늘_포포토끼.pdf`). qwen3:14b 생성은 페이지당 수 분 걸리므로 백그라운드로 실행할 것. 테스트 업로드는 검증 후 반드시 삭제 (사용자가 웹 UI를 병행 사용 중)
 
-3. **Frontend Component Changes**:
-   - Use Radix UI for consistency
-   - Fetch data via `lib/api/client.ts` methods
-   - Update Drizzle schema if schema changes needed
-   - Run `pnpm db:generate` to create a migration file, then `pnpm db:migrate` to apply it (works on a clean/empty DB too); `pnpm db:push` is a faster path for quick local iteration when you don't need a migration file
+## 알려진 제약
 
-4. **Testing**:
-   - Backend: `pytest tests/` for unit tests
-   - Frontend: `pnpm test` for Playwright e2e tests
-   - Manual: Run `python run_api.py` + `pnpm dev` and test in browser
+- **포트**: FastAPI 8001, Next.js 3000, Streamlit 8501
+- **ChromaDB**: `data/vectors/` 삭제 시 임베딩 초기화 (재업로드 필요)
+- **동시성**: dev 모드는 `reload=True` — 소스 수정 시 서버 재시작됨 (진행 중 요청 유실 주의). Ollama는 요청을 순차 처리(`-np 1`)
+- **OCR 의존성**: 시스템 `tesseract` + `chi_sim`/`chi_tra`/`kor` 언어팩 필수
 
-5. **Adding/Updating Priority Reference Context**:
-   - Add or edit a `*.json` file under `data/context/` — a flat `{"key": "value"}` map (e.g. `{"중국어 용어": "한국어 번역"}`) for glossary-style lookups, or any other JSON shape for rules/facts/etc.
-   - No restart needed — `RAGService` reloads every file in `data/context/` on each query
+## 디버깅 팁
 
-## Known Constraints & Considerations
+- **API 연결**: 백엔드가 `http://localhost:8001`인지, CORS가 요청 origin을 허용하는지 확인
+- **벡터 DB 손상**: `data/vectors/` 삭제 후 PDF 재업로드
+- **프론트 DB 오류**: `pnpm db:migrate`는 빈 `web-ui/data/chat.db`에서도 동작. 대안: `npx tsx web-ui/lib/db/init-db.ts`
+- **중국어 OCR 깨짐**: `ImageHandler.remove_watermark()`가 워터마크를 실제로 제거하는지 전처리 이미지를 덤프해서 먼저 확인
+- **ChromaDB 내용 직접 조회**: `chromadb.PersistentClient(path='data/vectors')` → `get_collection(collection_name)` → `.get(include=['documents','metadatas'])`. `collection_name`은 `data/api.db`의 `pdfs` 테이블에서 조회. 여기 저장된 텍스트는 **업로드 시점** OCR 결과임에 주의
 
-- **Port Assignments**: FastAPI uses 8001, Next.js uses 3000, Streamlit uses 8501
-- **ChromaDB Persistence**: Vector DB stored in `data/vectors/`—deleting this resets embeddings
-- **CPU/Memory**: Large PDFs or many documents can be memory-intensive; chunk size may need tuning on weaker systems
-- **Concurrency**: FastAPI runs with `reload=True` in dev mode; production deployments should remove this
-- **OCR Dependencies**: Scanned-PDF OCR requires the system `tesseract` binary with `chi_sim`/`chi_tra`/`kor` language packs installed, not just the Python packages in `requirements.txt`
-- **Known issues, full-document translation (`_translate_pages`, unresolved)**: (1) ~7/11 pages on the sample PDF end with a persistent `_looks_duplicated` warning even after `MAX_PAGE_RETRY_ATTEMPTS` retries — root cause traced to a single untranslatable OCR-noise line (garbled text from a graphic/logo) or a page title echoed twice; the page's real content is unaffected and kept (by design), but the warning itself doesn't go away since retrying can't fix genuinely untranslatable input. (2) The last page of a multi-page translation has been observed coming back in English instead of the requested target language (e.g. Korean) while every other page was correctly translated — target-language drift on a single page, cause not yet investigated.
+## 알려진 문제점 및 개선 계획
 
-## Debugging Tips
+실제 검증(2026-07-23, 대바늘_포포토끼.pdf)에서 확인된 미해결 이슈와 개선 방향. 우선순위순.
 
-- **API Connection**: Verify backend is at `http://localhost:8001` and CORS allows origin
-- **Vector DB Corruption**: Delete `data/vectors/` and re-upload PDFs to rebuild
-- **Frontend Database Errors**: `pnpm db:migrate` (`web-ui/lib/db/migrate.ts`) now works on a missing/empty `web-ui/data/chat.db` — it creates the data dir and applies migrations from scratch. `npx tsx web-ui/lib/db/init-db.ts` is an alternative that also works from empty
-- **PyCharm/IDE**: Set Python interpreter to `venv/bin/python`; Next.js code completion works with TypeScript language service
-- **Garbled/wrong Chinese OCR text**: Check that `ImageHandler.remove_watermark()` is actually stripping the watermark (dump a preprocessed page image and inspect it) before assuming the OCR model itself is at fault
-
+1. ✅ **(해결됨, 2026-07-23) 마지막 페이지 번역 언어 드리프트** — 11페이지 번역 시 마지막 페이지만 한국어 대신 영어로 출력된 사례.
+   - 조치: `_expects_korean_output()`(번역 의도 + 타깃 언어를 명시적으로 다른 언어로 지정하지 않았으면 True) + `_looks_untranslated_output()`(한글 비율 15% 미만이면 True)을 `_translate_pages()`의 페이지별 형식 검증에 추가 — 형식 오류로 간주해 기존 재시도 루프를 태움. 재시도 프롬프트에도 "요청한 언어로 번역"을 명시적으로 재확인시킴
+2. ✅ **(해결됨, 2026-07-23) 번역 불가 OCR 잡음 줄이 중복 감지 재시도를 낭비** — `V 2061 : 人 2` 같은 잡음 줄은 모델이 원문/번역 자리에 똑같이 복사해 `_looks_duplicated()`에 걸리고, 재시도 2회(페이지당 수 분)를 소모한 뒤에야 결과 유지로 넘어감
+   - 조치: `_looks_duplicated()`가 중복된 블록에 **한글(번역) 줄이 최소 1개 포함된 경우에만** True를 반환하도록 변경 — 잡음 줄만 반복된 경우(번역 대상 자체가 없어 재시도로 못 고치는 경우)는 더 이상 걸리지 않음. 실제 번역 내용이 중복된 진짜 문제(전체 페이지 재생성, 헤더/워터마크+번역 동반 중복)는 여전히 감지됨
+3. ✅ **(해결됨, 2026-07-23) 수량 표기 어색함** — `[12针]`이 `[12코]` 대신 `[12개의 코]`로 출력됨 (용어는 맞지만 "개의"가 불필요)
+   - 조치: `TRANSLATION_LINE_INSTRUCTIONS`에 "숫자와 단위는 붙여서 표기(12코, 12개의 코 금지)" 규칙 추가 + `_normalize_korean_counts()` 결정적 후처리(정규식 `(\d+)\s*개의\s*코` → `\1코`, `query_multi_pdf`에서 번역 응답에 항상 적용)로 이중 안전망. ⚠️ 정규식에 트레일링 `\b`(단어 경계)를 넣으면 안 됨 — 한글 조사(와/를 등)가 코에 공백 없이 붙어 Python의 유니코드 인식 `\b`가 한글-한글 사이를 경계로 보지 않아 매칭이 조용히 실패함
+4. ✅ **(해결됨, 2026-07-23) 박제된 구버전 OCR 임베딩** — OCR 언어 수정 이전에 업로드된 PDF는 ChromaDB에 깨진 텍스트가 남아 있고, 번역 외 일반 질의는 이 텍스트를 그대로 씀
+   - 조치(B안): "재-OCR 결과로 컬렉션 갱신" 기능 추가. `PDFService.refresh_ocr(pdf_id, db, ocr_language=None)` — 원본 파일을 `CJK_OCR_LANGUAGE`(`text_extractor.py`, `chi_sim+chi_tra+kor`)로 재-OCR하고 기존 컬렉션을 삭제 후 **같은 `collection_name`으로 재생성** (`pdf_id`/`collection_name` 불변, `doc_count`/`page_count`만 갱신). `POST /api/v1/pdfs/{pdf_id}/refresh-ocr` 엔드포인트로 노출, 웹 UI 사이드바에 PDF별 새로고침 아이콘(호버 시 노출) 추가. `doc_count != page_count`(원래 OCR 문서가 아님) 또는 원본 파일 없음이면 400, PDF 없음이면 404. `VectorStore.delete_collection_by_name()` 헬퍼 신설(기존 `delete_pdf`의 raw Chroma 생성 코드도 이걸로 정리) — 임의의 컬렉션명을 인스턴스 상태와 무관하게 삭제 가능
+5. **저장소 잔재 정리** — ChromaDB의 0청크 고아 컬렉션 2개, `api.db`의 미사용 `analysis_results` 테이블, 레거시 `core/rag.py`·`core/llm.py`(+ `tests/test_rag.py`)
+   - 개선안: 고아 컬렉션/테이블 삭제 스크립트. 레거시 모듈은 Streamlit 방향성 결정 후 제거 여부 판단
+6. **채팅 기록 이중 저장** — 백엔드 `api.db`와 프론트 `chat.db`에 같은 대화가 따로 저장되어 동기화되지 않음
+   - 개선안: 프론트를 단일 소스로 하고 백엔드 저장은 옵션화, 또는 그 반대. 구조 결정이 필요한 사안이라 별도 논의
+7. **서버 직접 응답 범위 확장** — 현재 페이지 수/페이지 원문만 LLM 우회. 파일명·업로드일·청크 수 등도 같은 패턴으로 확장 가능
+8. **`needsDocumentContext()` 키워드 분류기(route.ts)가 조잡** — "this", "explain" 등 광범위한 영어 키워드라 일반 대화도 문서 질문으로 오분류 가능
+9. **pre-commit이 pytest 대신 unittest 실행** — CI(pytest)와 불일치. `.pre-commit-config.yaml`의 entry를 pytest로 교체 검토
+10. **API 응답에 기계판독용 `truncated` 플래그 없음** — 현재는 답변 텍스트의 ⚠️ 문구로만 표시. `metadata` dict에 boolean 추가하면 UI가 활용 가능

@@ -19,9 +19,15 @@ from src.api.services.rag_service import (
     RAGService,
     _detect_ocr_language_override,
     _estimate_num_ctx,
+    _expects_korean_output,
     _line_instructions_for,
+    _detect_page_range,
     _looks_correctly_interleaved,
     _looks_duplicated,
+    _looks_untranslated_output,
+    _normalize_korean_counts,
+    _wants_page_count,
+    _wants_raw_page_content,
     _wants_translation,
     _wants_verbatim_or_translation,
 )
@@ -165,9 +171,16 @@ def test_detect_ocr_language_override_no_translation_keyword():
     assert _detect_ocr_language_override("이 문서를 요약해줘") is None
 
 
-def test_detect_ocr_language_override_only_one_language_named():
-    # Needs an explicit source AND target — a single named language isn't enough.
-    assert _detect_ocr_language_override("중국어를 번역해줘") is None
+def test_detect_ocr_language_override_falls_back_to_cjk_default_without_two_languages():
+    # Translation intent alone (fewer than 2 explicit language names) still
+    # narrows away from "eng" — regression test for the exact reported bug:
+    # "번역해줘" phrasings that only name the target language (or no language
+    # at all) were previously falling through to the un-narrowed, eng-mixed
+    # default and using the stale/garbled originally-stored OCR text.
+    assert _detect_ocr_language_override("중국어를 번역해줘") == "chi_sim+chi_tra+kor"
+    assert _detect_ocr_language_override("1~2페이지 내용을 한국어로 번역해줘") == "chi_sim+chi_tra+kor"
+    assert _detect_ocr_language_override("이 문서를 번역해줘") == "chi_sim+chi_tra+kor"
+    # No translation intent at all → still None, regardless of language names.
     assert _detect_ocr_language_override("한국어로 요약해줘") is None
 
 
@@ -200,35 +213,38 @@ def test_looks_correctly_interleaved_true_for_short_text():
 
 
 def test_looks_duplicated_true_for_repeated_block():
-    lines = ["R1 : 全下针", "R2 : 2下针，加针", "R3 : 全下针", "R4 : 全下针", "R5 : 全下针", "R6 : 全下针"]
-    text = "\n".join(lines[:3] + lines[:3])  # whole block repeated
+    # Translation-mode block (original + Hangul translation lines) repeated
+    # wholesale — the real "whole page generated twice" failure mode.
+    lines = ["R1 : 全下针", "R1: 전체 아래뜨기", "R2 : 2下针，加针", "R2: 2 아래뜨기, 코늘림"]
+    text = "\n".join(lines + lines)
     assert _looks_duplicated(text) is True
 
 
 def test_looks_duplicated_false_for_distinct_content():
-    text = "\n".join([f"R{i} : 全下针" for i in range(1, 7)])
+    lines = [f"R{i} : 全下针\nR{i}: 전체 아래뜨기" for i in range(1, 7)]
+    text = "\n".join(lines)
     assert _looks_duplicated(text) is False
 
 
 def test_looks_duplicated_true_for_localized_prefix_repeat():
-    # Observed failure mode: only a short watermark/header snippet echoes
-    # twice before the real (non-repeating) content — not a whole-response
-    # mirror, so a naive first-half-vs-second-half check would miss this.
-    header = ["请勿二改勿商用", "更多图解请关注"]
-    body = [f"R{i} : 全下针" for i in range(1, 9)]  # all distinct, no repeats
+    # Observed failure mode: only a short watermark/header snippet (with its
+    # Hangul translation) echoes twice before the real, non-repeating
+    # content — not a whole-response mirror, so a naive first-half-vs-
+    # second-half check would miss this.
+    header = ["请勿二改勿商用", "재판매 및 상업적 이용 금지"]
+    body = [f"R{i} : 全下针\nR{i}: 전체 아래뜨기" for i in range(1, 5)]
     text = "\n".join(header + header + body)
     assert _looks_duplicated(text) is True
 
 
 def test_looks_duplicated_true_for_pairwise_adjacent_duplicate_lines():
-    # Real observed pattern: each watermark/junk line doubled up right where
-    # it stands (AABBCC), not a repeated multi-line block (ABCABC) — a
+    # Real observed pattern: each translated line doubled up right where it
+    # stands (AABBCC), not a repeated multi-line block (ABCABC) — a
     # block-only scan (k>=2) misses this; must be caught at k=1 too.
     text = "\n".join([
-        "雪請勿二改勿商用", "雪請勿二改勿商用",
-        "( 更多回解請關注 )", "( 更多回解請關注 )",
-        "身体:", "身体:",
+        "身体:", "몸통:", "身体:", "몸통:",
         "注意 : 左加针，右加针同一渡线位置挑起分别编织",
+        "주의: 왼쪽 코늘림, 오른쪽 코늘림은 같은 실 가닥 위치에서 각각 뜬다",
     ])
     assert _looks_duplicated(text) is True
 
@@ -236,8 +252,81 @@ def test_looks_duplicated_true_for_pairwise_adjacent_duplicate_lines():
 def test_looks_duplicated_false_for_single_repeated_line():
     # A single recurring instruction line ("全下针") is common and legitimate
     # across different, non-adjacent rows — must not false-positive.
-    text = "\n".join(["R1 : 全下针", "R2 : 2下针，加针", "R3 : 全下针", "R4 : 2下针，加针"])
+    text = "\n".join([
+        "R1 : 全下针", "R1: 전체 아래뜨기",
+        "R2 : 2下针，加针", "R2: 2 아래뜨기, 코늘림",
+        "R3 : 全下针", "R3: 전체 아래뜨기",
+        "R4 : 2下针，加针", "R4: 2 아래뜨기, 코늘림",
+    ])
     assert _looks_duplicated(text) is False
+
+
+def test_looks_duplicated_false_for_repeated_untranslatable_noise():
+    # OCR-noise lines with nothing meaningful to translate get echoed
+    # verbatim by the model into both the "original" and "translation"
+    # slots — this is expected/harmless, not a generation glitch, and must
+    # NOT be flagged: flagging it used to burn a full retry budget (minutes
+    # per page) on input a retry can never fix.
+    text = "\n".join([
+        "V 2061 : 人 2", "V 2061 : 人 2",
+        "R1 : 全下针", "R1: 전체 아래뜨기",
+    ])
+    assert _looks_duplicated(text) is False
+
+
+def test_expects_korean_output_true_for_plain_translation_request():
+    assert _expects_korean_output("중국어 도안을 한국어로 번역해줘") is True
+    assert _expects_korean_output("1~2페이지 내용을 한국어로 번역해줘") is True
+
+
+def test_expects_korean_output_false_when_explicit_other_target():
+    assert _expects_korean_output("이 문서를 영어로 번역해줘") is False
+    assert _expects_korean_output("translate this to Japanese") is False
+
+
+def test_expects_korean_output_false_when_no_translation_intent():
+    assert _expects_korean_output("이 문서를 요약해줘") is False
+
+
+def test_looks_untranslated_output_true_for_english_only_page():
+    text = "\n".join([
+        "Long-tail Cast On 69 sts",
+        "R1 : 3 sts K, 3 sts P, repeat until end [ 69 sts ]",
+        "R2 : Repeat 3 sts P, 3 sts K, repeat until end [ 69 sts ]",
+        "R3-7 : Repeat R1-2",
+    ])
+    assert _looks_untranslated_output(text) is True
+
+
+def test_looks_untranslated_output_false_for_correctly_interleaved_korean():
+    text = "\n".join([
+        "R1 : 全下针", "R1: 전체 아래뜨기",
+        "R2 : 2下针，加针", "R2: 2 아래뜨기, 코늘림",
+        "R3 : 全下针", "R3: 전체 아래뜨기",
+        "R4 : 2下针，加针", "R4: 2 아래뜨기, 코늘림",
+    ])
+    assert _looks_untranslated_output(text) is False
+
+
+def test_looks_untranslated_output_false_for_short_text():
+    assert _looks_untranslated_output("R1 : 全下针") is False
+
+
+def test_normalize_korean_counts():
+    assert _normalize_korean_counts("R32: (1K, k2tog)*6회 [12개의 코]") == "R32: (1K, k2tog)*6회 [12코]"
+    assert _normalize_korean_counts("[30개의 코], [18개의 코]") == "[30코], [18코]"
+    # Already-correct notation and unrelated text are left untouched.
+    assert _normalize_korean_counts("[12코]") == "[12코]"
+    assert _normalize_korean_counts("전체 아래뜨기") == "전체 아래뜨기"
+
+
+def test_normalize_korean_counts_with_attached_particle():
+    # Regression test: Korean particles (와/를/...) attach directly to 코
+    # with no separating character, so a regex relying on \b for the
+    # boundary silently fails here (Python's \b is Unicode-aware and does
+    # not treat Hangul-Hangul as a boundary).
+    text = "남은 3개의 코와 시작하는 3개의 코를 마커에 넣습니다"
+    assert _normalize_korean_counts(text) == "남은 3코와 시작하는 3코를 마커에 넣습니다"
 
 
 def test_line_instructions_for_translation_request():
@@ -266,6 +355,79 @@ def test_wants_verbatim_or_translation_covers_plain_translation_requests():
     assert _wants_verbatim_or_translation("중국어 도안을 한국어로 번역해줘") is True
     assert _wants_verbatim_or_translation("그대로 나열해줘") is True
     assert _wants_verbatim_or_translation("이 문서를 요약해줘") is False
+
+
+def test_wants_page_count():
+    assert _wants_page_count("이 pdf는 총 몇 페이지야?") is True
+    assert _wants_page_count("How many pages does this document have?") is True
+    assert _wants_page_count("이 문서를 요약해줘") is False
+
+
+def test_query_multi_pdf_answers_page_count_without_llm():
+    # The LLM only ever sees chunked page TEXT as context, never page_count
+    # metadata, so it can never answer this correctly on its own — must be
+    # short-circuited before any model call.
+    from types import SimpleNamespace
+
+    service = RAGService()
+    fake_pdf = SimpleNamespace(name="test.pdf", pdf_id="pdf_1", page_count=11, doc_count=11)
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
+
+    answer, sources, reasoning_steps = service.query_multi_pdf(
+        question="이 pdf는 총 몇 페이지야?", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
+    )
+
+    assert "11페이지" in answer
+    assert sources == [{"pdf_name": "test.pdf", "pdf_id": "pdf_1", "chunk_index": 0}]
+    assert any("메타데이터에서 직접 답변" in s for s in reasoning_steps)
+
+
+def test_detect_page_range_various_formats():
+    assert _detect_page_range("1~2페이지 내용을 알려줘") == (1, 2)
+    assert _detect_page_range("1-2페이지 내용 보여줘") == (1, 2)
+    assert _detect_page_range("1페이지부터 3페이지까지 번역해줘") == (1, 3)
+    assert _detect_page_range("pages 2-4 translate please") == (2, 4)
+    assert _detect_page_range("page 5 내용 알려줘") == (5, 5)
+    assert _detect_page_range("1페이지에 코가 몇 개야?") == (1, 1)
+    assert _detect_page_range("이 문서 요약해줘") is None
+
+
+def test_wants_raw_page_content():
+    assert _wants_raw_page_content("1~2페이지 중국어 내용을 알려줘") is True
+    assert _wants_raw_page_content("1페이지부터 3페이지까지 번역해줘") is False  # translation intent
+    assert _wants_raw_page_content("1페이지에 코가 몇 개야?") is False  # analytical ("몇")
+
+
+def test_query_multi_pdf_answers_page_range_raw_content_without_llm():
+    from types import SimpleNamespace
+
+    service = RAGService()
+    fake_pdf = SimpleNamespace(
+        name="test.pdf", pdf_id="pdf_1", page_count=3, doc_count=3,
+        collection_name="col_1", file_path=None,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
+
+    fake_vector_db = MagicMock()
+    fake_vector_db.get.return_value = {
+        "documents": ["page 1 content", "page 2 content", "page 3 content"],
+        "metadatas": [{"source_page": 1}, {"source_page": 2}, {"source_page": 3}],
+    }
+
+    with patch("src.api.services.rag_service.Chroma", return_value=fake_vector_db), \
+         patch("src.api.services.rag_service.OllamaEmbeddings"):
+        answer, sources, reasoning_steps = service.query_multi_pdf(
+            question="1~2페이지 내용을 알려줘", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
+        )
+
+    assert "page 1 content" in answer
+    assert "page 2 content" in answer
+    assert "page 3 content" not in answer  # outside the 1-2 range, filtered out
+    assert len(sources) == 2
+    assert any("페이지 범위 감지" in s for s in reasoning_steps)
+    assert any("LLM 호출 없음" in s for s in reasoning_steps)
 
 
 def test_estimate_num_ctx_floor_applies_regardless_of_output_budget():

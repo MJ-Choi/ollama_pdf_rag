@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from ...core.document import DocumentProcessor
 from ...core.embeddings import VectorStore
+from ...core.text_extractor import TextExtractor, CJK_OCR_LANGUAGE
 from ..database import PDFMetadata
 from ..config import settings
 
@@ -133,20 +134,7 @@ class PDFService:
         if not pdf:
             return False
 
-        # Delete vector collection
-        try:
-            from langchain_chroma import Chroma
-        except ImportError:
-            from langchain_community.vectorstores import Chroma
-        from langchain_ollama import OllamaEmbeddings
-
-        embeddings = OllamaEmbeddings(model="nomic-embed-text")
-        vector_db = Chroma(
-            persist_directory=settings.VECTOR_DB_DIR,
-            embedding_function=embeddings,
-            collection_name=pdf.collection_name
-        )
-        vector_db.delete_collection()
+        self.vector_store.delete_collection_by_name(pdf.collection_name)
 
         # Delete file if it exists
         if pdf.file_path and os.path.exists(pdf.file_path):
@@ -157,6 +145,85 @@ class PDFService:
         db.commit()
 
         return True
+
+    def refresh_ocr(
+        self,
+        pdf_id: str,
+        db: Session,
+        ocr_language: Optional[str] = None
+    ) -> PDFMetadata:
+        """Re-OCR a PDF's original file and replace its stored ChromaDB
+        collection with the fresh result.
+
+        Upload-time OCR is a one-time snapshot: a PDF uploaded before an OCR
+        language/quality fix (e.g. narrowing away from the "eng"-mixed
+        default, see CJK_OCR_LANGUAGE) keeps stale/degraded text embedded
+        forever, since general (non-translation) queries read straight from
+        the stored collection rather than re-OCR'ing. This re-runs OCR
+        against the same original file and swaps the collection's contents —
+        `pdf_id` and `collection_name` are preserved, only doc_count/
+        page_count and the embedded text change.
+
+        Args:
+            pdf_id: PDF identifier
+            db: Database session
+            ocr_language: Tesseract language string to OCR with (defaults to
+                CJK_OCR_LANGUAGE — this app's primary use case is CJK scans)
+
+        Returns:
+            Updated PDF metadata
+
+        Raises:
+            LookupError: no PDF with this pdf_id
+            ValueError: PDF wasn't originally OCR'd (nothing to refresh), its
+                original file is missing from disk, or re-OCR yields no text
+        """
+        pdf = self.get_pdf(pdf_id, db)
+        if not pdf:
+            raise LookupError(f"PDF not found: {pdf_id}")
+        # doc_count == page_count is how the OCR path stores documents (one
+        # chunk per page, see upload_and_process above) — a native-text PDF
+        # chunked at 7500 chars/page almost never matches its page count.
+        if pdf.doc_count != pdf.page_count:
+            raise ValueError("This PDF wasn't OCR'd at upload — nothing to refresh")
+        if not pdf.file_path or not os.path.exists(pdf.file_path):
+            raise ValueError(f"Original file not found on disk: {pdf.file_path}")
+
+        extractor = TextExtractor()
+        extraction_result = extractor.extract_text_from_scanned_pdf(
+            Path(pdf.file_path), ocr_language=ocr_language or CJK_OCR_LANGUAGE
+        )
+        chunks = extractor.create_document_chunks(extraction_result)
+        if not chunks:
+            raise ValueError("Re-OCR produced no text")
+
+        page_numbers = {
+            chunk.metadata.get("source_page")
+            for chunk in chunks
+            if chunk.metadata.get("source_page") is not None
+        }
+        page_count = len(page_numbers) if page_numbers else len(chunks)
+
+        for i, chunk in enumerate(chunks):
+            chunk.metadata.update({
+                "pdf_id": pdf_id,
+                "pdf_name": pdf.name,
+                "chunk_index": i,
+                "source_file": pdf.name,
+            })
+
+        self.vector_store.delete_collection_by_name(pdf.collection_name)
+        self.vector_store.create_vector_db(
+            documents=chunks,
+            collection_name=pdf.collection_name
+        )
+
+        pdf.doc_count = len(chunks)
+        pdf.page_count = page_count
+        db.commit()
+        db.refresh(pdf)
+
+        return pdf
 
     def _generate_pdf_id(self, filename: str) -> str:
         """Generate unique PDF ID.

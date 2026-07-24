@@ -22,7 +22,7 @@ from langchain_ollama import OllamaEmbeddings
 
 from ..database import PDFMetadata, ChatSession, ChatMessage
 from ..config import settings
-from ...core.text_extractor import TextExtractor
+from ...core.text_extractor import TextExtractor, CJK_OCR_LANGUAGE
 
 logger = logging.getLogger(__name__)
 
@@ -125,15 +125,28 @@ TRANSLATION_LINE_INSTRUCTIONS = (
     "a line. Do NOT summarize, paraphrase, deduplicate, or reorganize by topic — "
     "preserve the exact order and every line, including row/section labels (e.g. "
     "R1, R2, 耳部). Only insert a source label (e.g. [Source: filename]) when "
-    "switching between different source documents.\n\n"
-    "Example of the required format (source line, then its translation, repeated "
-    "for every line — never all originals first followed by all translations):\n"
-    "R1 : 全下针\n"
-    "R1: 전체 아래뜨기\n"
-    "R2 : 2下针，加针 [3针]\n"
-    "R2: 2 아래뜨기, 코늘림 [3코]\n"
-    "Follow this exact pattern for every line below, and do not repeat any line "
-    "or block twice."
+    "switching between different source documents. If a PRIORITY REFERENCE "
+    "CONTEXT section appears above, its term mappings are mandatory for your "
+    "translation — use its exact wording for any matching term instead of your "
+    "own phrasing, even if your own phrasing seems equally correct. Apply each "
+    "mapping literally per occurrence of that exact source text — do NOT "
+    "generalize a compound term's mapping to a different, standalone "
+    "occurrence of one of its characters. For example, if the context maps a "
+    "compound term (e.g. 下针 → K) AND separately maps one of its characters "
+    "alone (e.g. 针 → 코), a standalone occurrence of that character — such as "
+    "in a stitch count like [12针] — must use ITS OWN mapping (→ [12코]), not "
+    "the compound term's mapping (never [12개의 K]). When a count appears with "
+    "a unit, join the number directly to the unit with no counter particle in "
+    "between — write '12코', never '12개의 코'.\n\n"
+    "Example of the required STRUCTURE only (the actual terms below are "
+    "placeholders — do NOT reuse this exact wording; always prefer the "
+    "priority reference context's terms for real content):\n"
+    "R1 : [source line A]\n"
+    "R1: [translation of line A]\n"
+    "R2 : [source line B]\n"
+    "R2: [translation of line B]\n"
+    "Follow this exact interleaving pattern for every line below, and do not "
+    "repeat any line or block twice."
 )
 
 
@@ -148,22 +161,33 @@ _LANGUAGE_NAME_TO_OCR_CODE = {
     "한국어": "kor",
     "영어": "eng",
 }
-TRANSLATION_INTENT_KEYWORDS = ["번역"]
+TRANSLATION_INTENT_KEYWORDS = ["번역", "translate", "translation"]
+
+
+# Fallback OCR language used for a translation-intent question that doesn't
+# explicitly name (or only names one of) the source/target languages — e.g.
+# "1~2페이지 내용을 한국어로 번역해줘" names only the target ("한국어"). This
+# app's real documents are CJK scans (see chi_knitting.json), and every test
+# this session showed "eng" measurably degrading CJK recognition — so
+# translation intent alone is treated as enough signal to drop it, rather
+# than requiring the user to spell out "중국어" every time. Reuses
+# CJK_OCR_LANGUAGE (text_extractor.py) — same default PDFService.refresh_ocr()
+# uses to rebuild a stale collection.
 
 
 def _detect_ocr_language_override(question: str) -> Optional[str]:
-    """Detect an explicit source+target language pair in a translation-style
-    question and return a narrowed tesseract language string, e.g.
-    "chi_sim+chi_tra+kor" for "중국어가 source, 한국어가 target". Returns None
-    (keep DEFAULT_OCR_LANGUAGE, which still includes "eng") unless both a
-    translation-intent keyword AND at least two distinct languages are named —
-    a single language mention isn't enough to safely narrow the language pack.
+    """For a translation-style question, return a narrowed tesseract language
+    string to re-OCR with — e.g. "chi_sim+chi_tra+kor" for "중국어가 source,
+    한국어가 target", or the same CJK-only default (CJK_OCR_LANGUAGE) when the
+    question doesn't name two explicit languages. Returns None (keep
+    DEFAULT_OCR_LANGUAGE, which still includes "eng") only when there's no
+    translation intent at all.
     """
-    if not any(keyword in question for keyword in TRANSLATION_INTENT_KEYWORDS):
+    if not any(keyword.lower() in question.lower() for keyword in TRANSLATION_INTENT_KEYWORDS):
         return None
     matched_names = [name for name in _LANGUAGE_NAME_TO_OCR_CODE if name in question]
     if len(matched_names) < 2:
-        return None
+        return CJK_OCR_LANGUAGE
     codes: List[str] = []
     for name in matched_names:
         for part in _LANGUAGE_NAME_TO_OCR_CODE[name].split("+"):
@@ -177,7 +201,8 @@ def _wants_translation(question: str) -> bool:
     the same keyword set _detect_ocr_language_override uses). A translation request
     inherently means "reproduce every line, translated" — not "synthesize a summary" —
     even when it doesn't also contain an explicit verbatim keyword like "그대로"."""
-    return any(keyword in question for keyword in TRANSLATION_INTENT_KEYWORDS)
+    lowered = question.lower()
+    return any(keyword.lower() in lowered for keyword in TRANSLATION_INTENT_KEYWORDS)
 
 
 def _wants_verbatim_or_translation(question: str) -> bool:
@@ -190,6 +215,75 @@ def _line_instructions_for(question: str) -> str:
     """Pick strict original+translation interleaving instructions when the
     question asks for a translation, vs plain verbatim reproduction otherwise."""
     return TRANSLATION_LINE_INSTRUCTIONS if _wants_translation(question) else VERBATIM_INSTRUCTIONS
+
+
+# "How many pages" questions are answerable directly from PDFMetadata.page_count
+# — already known with certainty from the upload-time OCR/chunking pass — so
+# there's no reason to burn an LLM call on it. Worse, the LLM literally has no
+# way to answer this correctly even if asked to: it only ever sees the chunked
+# page TEXT as context, never the page_count metadata itself, so without this
+# short-circuit it always (correctly, from its perspective) says the context
+# doesn't contain that information.
+PAGE_COUNT_KEYWORDS = [
+    "몇 페이지", "페이지 수", "총 페이지", "몇 장",
+    "how many pages", "page count", "number of pages", "total pages",
+]
+
+
+def _wants_page_count(question: str) -> bool:
+    lowered = question.lower()
+    return any(keyword.lower() in lowered for keyword in PAGE_COUNT_KEYWORDS)
+
+
+# Detects an explicit page range/single page named in the question (e.g.
+# "1~2페이지", "1-2페이지", "1페이지부터 2페이지까지", "pages 1-2", "page 1").
+# Every OCR'd page is already stored/re-extracted as its own chunk with a
+# `source_page` metadata field — this just lets a question select a subset
+# of those chunks instead of always using the whole document.
+_PAGE_RANGE_PATTERNS = [
+    re.compile(r'(\d+)\s*페이지부터\s*(\d+)\s*페이지까지'),
+    re.compile(r'(\d+)\s*[~\-–]\s*(\d+)\s*페이지'),
+    re.compile(r'pages?\s*(\d+)\s*(?:-|~|to)\s*(\d+)', re.IGNORECASE),
+]
+_SINGLE_PAGE_PATTERNS = [
+    re.compile(r'(\d+)\s*페이지'),
+    re.compile(r'\bpage\s*(\d+)\b', re.IGNORECASE),
+]
+
+
+def _detect_page_range(question: str) -> Optional[Tuple[int, int]]:
+    for pattern in _PAGE_RANGE_PATTERNS:
+        match = pattern.search(question)
+        if match:
+            start, end = int(match.group(1)), int(match.group(2))
+            return (min(start, end), max(start, end))
+    for pattern in _SINGLE_PAGE_PATTERNS:
+        match = pattern.search(question)
+        if match:
+            page = int(match.group(1))
+            return (page, page)
+    return None
+
+
+# When a page range is named without a translation intent, the question is
+# usually just "show me what's on those pages" — answerable directly from
+# already-stored/extracted page text, no LLM needed. These keywords signal
+# the opposite: the user wants the model to actually reason about the
+# content (count something, explain it, summarize it), so it still needs
+# the engine even though a page range was named.
+_ANALYTICAL_INTENT_KEYWORDS = [
+    "몇", "얼마", "어떻게", "왜", "설명해", "요약",
+    "explain", "how many", "why", "summarize", "summary",
+]
+
+
+def _wants_raw_page_content(question: str) -> bool:
+    """True if a page-range question should be answered with the raw stored
+    page text directly, instead of being handed to the LLM."""
+    if _wants_translation(question):
+        return False
+    lowered = question.lower()
+    return not any(keyword.lower() in lowered for keyword in _ANALYTICAL_INTENT_KEYWORDS)
 
 
 # Heuristics below catch two failure modes observed from qwen3:14b on the
@@ -222,16 +316,18 @@ def _looks_correctly_interleaved(text: str) -> bool:
 
 
 def _looks_duplicated(text: str) -> bool:
-    """True if the response contains a contiguous block of one or more lines
-    that is immediately repeated back-to-back — covers all observed failure
-    modes: the WHOLE page generated twice (a large block), a short
-    watermark/header snippet echoed twice before the real content starts (a
-    small block at the front), and individual lines each doubled up in a row
-    (AABBCC — distinct from a large repeated block, so a block-only scan
-    starting at k=2 misses it). A single exactly-repeated line is virtually
-    never legitimate here: every real content line carries a distinguishing
-    row/section label (R1 vs R2, etc.), so two byte-identical adjacent lines
-    is a generation glitch, not coincidence."""
+    """True if the response contains a contiguous block of lines that is
+    immediately repeated back-to-back AND the repeated block includes at
+    least one translated (Hangul) line — covers the real failure modes (the
+    WHOLE page generated twice, or translated lines doubled up in place)
+    while deliberately IGNORING identical adjacent copies of lines with no
+    Hangul in them. The latter is the model's expected behavior for
+    untranslatable OCR noise (a junk line like "V 2061 : 人 2" gets copied
+    verbatim into both the "original" and "translation" slots) — flagging it
+    used to burn MAX_PAGE_RETRY_ATTEMPTS retries (minutes per page) on
+    something a retry can never fix, since the input itself is untranslatable.
+    Only called in translation mode (see _translate_pages), so requiring
+    Hangul in the duplicate evidence is safe."""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     n = len(lines)
     if n < 2:
@@ -240,9 +336,61 @@ def _looks_duplicated(text: str) -> bool:
     # largest possible block down to a single line.
     for k in range(n // 2, 0, -1):
         for i in range(0, n - 2 * k + 1):
-            if lines[i:i + k] == lines[i + k:i + 2 * k]:
+            if lines[i:i + k] == lines[i + k:i + 2 * k] and any(
+                _HANGUL_RE.search(ln) for ln in lines[i:i + k]
+            ):
                 return True
     return False
+
+
+# --- Target-language validation (fix for "last page drifts to English") ---
+# A multi-page translation was observed coming back with one page translated
+# into English while every other page was correctly Korean, for the same
+# question. Each page is an independent LLM call, so validate each page's
+# OUTPUT language and retry through the existing format-issue loop.
+_EXPLICIT_NON_KOREAN_TARGET_RE = re.compile(
+    r'(?:영어|일본어|중국어|english|japanese|chinese)\s*로\s*번역'
+    r'|(?:in)?to\s+(?:english|japanese|chinese)',
+    re.IGNORECASE,
+)
+
+
+def _expects_korean_output(question: str) -> bool:
+    """True if a translation request's target language is Korean — the app's
+    default assumption (Korean-speaking user, Korean UI) unless the question
+    explicitly names a different target like "영어로 번역"/"translate to
+    English". Note "중국어로 된 문서를 한국어로 번역" does NOT match the
+    non-Korean pattern ("중국어로 된" isn't followed by 번역)."""
+    if not _wants_translation(question):
+        return False
+    return not _EXPLICIT_NON_KOREAN_TARGET_RE.search(question)
+
+
+def _looks_untranslated_output(text: str) -> bool:
+    """True if a Korean-target translation response contains (almost) no
+    Hangul lines — i.e. the model answered in the wrong language entirely,
+    or skipped translating. A correctly interleaved Chinese→Korean page has
+    Hangul on roughly half its lines; an English/Chinese-only page has ~0."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 4:
+        return False  # too short to judge reliably
+    hangul_lines = sum(1 for ln in lines if _HANGUL_RE.search(ln))
+    return hangul_lines / len(lines) < 0.15
+
+
+# Deterministic cleanup for a phrasing quirk qwen3 keeps producing even with
+# glossary + instructions: stitch counts rendered as "12개의 코" instead of
+# the natural knitting notation "12코". Applied to translation-mode answers
+# as a post-processing step, so it holds regardless of model compliance.
+# No trailing \b: Korean particles (와/를/가/...) attach directly to 코 with
+# no separating character, and \w is Unicode-aware so Python's \b does NOT
+# treat a Hangul-Hangul boundary as a word boundary — "12개의 코와" would
+# silently fail to match with one.
+_KOREAN_COUNT_PARTICLE_RE = re.compile(r'(\d+)\s*개의\s*코')
+
+
+def _normalize_korean_counts(text: str) -> str:
+    return _KOREAN_COUNT_PARTICLE_RE.sub(r'\1코', text)
 
 
 class RAGService:
@@ -311,9 +459,13 @@ class RAGService:
         pdf: PDFMetadata,
         ocr_language: str,
         reasoning_steps: List[str],
+        page_range: Optional[Tuple[int, int]] = None,
     ) -> Optional[List[Document]]:
         """Re-run OCR on `pdf`'s original file with a narrower language pack,
         for this query only — the stored vector DB collection is untouched.
+        `page_range` (start, end), if given, limits OCR to just those pages
+        instead of the whole document — faster, and the returned docs'
+        `source_page` metadata already reflects the real page numbers.
 
         Returns None (caller falls back to the stored/embedded chunks) when
         the PDF wasn't originally OCR'd, the file is missing, or extraction
@@ -329,10 +481,13 @@ class RAGService:
             reasoning_steps.append(f"⚠️ 재-OCR 건너뜀 — 원본 파일을 찾을 수 없음: {pdf.name}")
             return None
 
-        reasoning_steps.append(f"🔁 재-OCR 중 ({ocr_language}): {pdf.name}")
+        page_note = f", {page_range[0]}-{page_range[1]}페이지만" if page_range else ""
+        reasoning_steps.append(f"🔁 재-OCR 중 ({ocr_language}{page_note}): {pdf.name}")
         extractor = TextExtractor()
         extraction_result = extractor.extract_text_from_scanned_pdf(
-            Path(pdf.file_path), ocr_language=ocr_language
+            Path(pdf.file_path), ocr_language=ocr_language,
+            start_page=page_range[0] if page_range else None,
+            end_page=page_range[1] if page_range else None,
         )
         docs = extractor.create_document_chunks(extraction_result)
         if not docs:
@@ -511,6 +666,8 @@ class RAGService:
                 if last_error is None and translation_requested and page_text:
                     if _looks_duplicated(page_text):
                         format_issue = "응답이 중복 생성됨"
+                    elif _expects_korean_output(question) and _looks_untranslated_output(page_text):
+                        format_issue = "요청한 언어(한국어)로 번역되지 않음"
                     elif not _looks_correctly_interleaved(page_text):
                         format_issue = "원문/번역이 줄 단위로 교차되지 않음"
 
@@ -537,7 +694,9 @@ class RAGService:
                             f"That output was rejected: {format_issue}. Redo this page "
                             "from scratch following the exact original-line-then-"
                             "translation-line interleaved format shown earlier, with "
-                            "no duplicated content."
+                            "no duplicated content, translating into the language the "
+                            "user asked for (한국어, unless they explicitly requested "
+                            "another language)."
                         )),
                     ]
 
@@ -587,6 +746,19 @@ class RAGService:
 
         reasoning_steps.append(f"📚 Searching across {len(pdfs)} PDF(s): {', '.join([p.name for p in pdfs])}")
 
+        # Page-count questions are answered directly from stored metadata —
+        # see _wants_page_count's docstring for why the LLM can never get
+        # this right on its own.
+        if _wants_page_count(question):
+            reasoning_steps.append("📐 페이지 수 질문 감지 — 저장된 메타데이터에서 직접 답변 (LLM 호출 없음)")
+            answer = "\n".join(f"- {pdf.name}: {pdf.page_count}페이지" for pdf in pdfs)
+            sources = [
+                {"pdf_name": pdf.name, "pdf_id": pdf.pdf_id, "chunk_index": 0}
+                for pdf in pdfs
+            ]
+            reasoning_steps.append("✨ Answer generated successfully!")
+            return answer, sources, reasoning_steps
+
         # An explicit "중국어 도안을 한국어로 번역해줘"-style question narrows OCR to
         # just the named source+target languages for THIS query (re-OCR from the
         # original file, not persisted back to the stored vector DB/collection).
@@ -595,6 +767,14 @@ class RAGService:
             reasoning_steps.append(
                 f"🔤 번역 요청 감지 — 이번 질의에 한해 OCR 언어를 '{ocr_language_override}'로 좁혀서 원본 PDF를 다시 읽습니다"
             )
+
+        # An explicit page range/single page named in the question (e.g.
+        # "1~2페이지") scopes both re-OCR (if any) and the retrieved chunks
+        # to just those pages — every OCR'd page is already its own chunk
+        # with a `source_page` field, this just selects a subset of them.
+        page_range = _detect_page_range(question)
+        if page_range:
+            reasoning_steps.append(f"📑 페이지 범위 감지: {page_range[0]}~{page_range[1]}페이지로 컨텍스트를 좁힙니다")
 
         # Initialize LLM (used for query-generation only; the final answer
         # call gets its own instance sized to the actual context below)
@@ -618,7 +798,9 @@ class RAGService:
             for pdf in pdfs:
                 docs = None
                 if ocr_language_override:
-                    docs = self._reocr_pdf_chunks(pdf, ocr_language_override, reasoning_steps)
+                    docs = self._reocr_pdf_chunks(
+                        pdf, ocr_language_override, reasoning_steps, page_range=page_range
+                    )
 
                 if docs is not None:
                     all_docs.extend(docs)
@@ -700,6 +882,44 @@ class RAGService:
                     print(f"Error retrieving from {pdf.name}: {e}")
 
         reasoning_steps.append(f"📊 Total chunks retrieved: {len(all_docs)}")
+
+        # Scope to the requested page range (full-document mode only — a
+        # retrieval/large-corpus query's chunks aren't reliably one-per-page).
+        # Docs without a source_page are kept rather than dropped, since we
+        # can't confirm whether they're in range.
+        if page_range and use_full_context:
+            start, end = page_range
+            filtered_docs = [
+                doc for doc in all_docs
+                if doc.metadata.get("source_page") is None or start <= doc.metadata["source_page"] <= end
+            ]
+            if filtered_docs:
+                all_docs = filtered_docs
+                reasoning_steps.append(f"✂️ {start}~{end}페이지로 필터링: {len(all_docs)}개 청크")
+            else:
+                reasoning_steps.append(f"⚠️ {start}~{end}페이지에 해당하는 청크를 찾지 못함 — 전체 컨텍스트 사용")
+
+            # A plain "show me / tell me the content of these pages" request
+            # (no translation, no analytical keyword) is answerable directly
+            # from the already-extracted page text — no LLM call needed.
+            if filtered_docs and _wants_raw_page_content(question):
+                reasoning_steps.append("📋 페이지 원문 직접 반환 (LLM 호출 없음)")
+                answer_parts = []
+                for doc in all_docs:
+                    page_label = doc.metadata.get("source_page")
+                    header = f"[{page_label}페이지]" if page_label is not None else ""
+                    answer_parts.append(f"{header}\n{doc.page_content}".strip())
+                answer = "\n\n".join(answer_parts)
+                sources = [
+                    {
+                        "pdf_name": doc.metadata.get("pdf_name", "Unknown"),
+                        "pdf_id": doc.metadata.get("pdf_id", ""),
+                        "chunk_index": doc.metadata.get("chunk_index", 0),
+                    }
+                    for doc in all_docs
+                ]
+                reasoning_steps.append("✨ Answer generated successfully!")
+                return answer, sources, reasoning_steps
 
         # In full-document mode, use every chunk; otherwise keep the
         # existing top-10 cap for retrieval-based (large corpus) mode.
@@ -827,6 +1047,12 @@ Think through each step carefully, showing your reasoning process."""
                 response, truncated = self._invoke_with_continuation(
                     answer_llm, prompt_messages, reasoning_steps
                 )
+
+        # Deterministic phrasing cleanup for translation answers ("12개의 코"
+        # → "12코") — instructions alone don't fully stop the model from
+        # inserting the counter particle, so normalize it here regardless.
+        if _wants_translation(question):
+            response = _normalize_korean_counts(response)
 
         # Extract source information
         sources = [

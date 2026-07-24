@@ -36,6 +36,15 @@ except ImportError:
 DEFAULT_OCR_LANGUAGE = "eng+chi_sim+chi_tra+kor"
 DEFAULT_DPI = 300
 
+# CJK-only OCR language pack (no "eng"). Mixing "eng" into Tesseract's
+# language set measurably degrades CJK recognition (e.g. "下针" misread as
+# "FH, Get,"), so anything that already knows it's dealing with a CJK
+# document — a query-time translation re-OCR, or refreshing a stale
+# collection that was embedded before this was understood — should use
+# this instead of DEFAULT_OCR_LANGUAGE. Shared by RAGService (query-time
+# re-OCR) and PDFService (refresh_ocr, collection refresh).
+CJK_OCR_LANGUAGE = "chi_sim+chi_tra+kor"
+
 # Tesseract treats each CJK character as its own "word" and joins them with
 # spaces, e.g. "用 魔 环 起". That hurts readability and embedding/retrieval
 # quality, so collapse whitespace directly between two CJK characters.
