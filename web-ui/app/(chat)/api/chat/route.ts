@@ -37,19 +37,40 @@ interface PostRequestBody {
   selectedPdfIds?: string[]; // PDFs selected by user
 }
 
-// Simple question classifier - checks if question likely needs document context
+// Simple question classifier - checks if question likely needs document
+// context. Only reached when the user selected ZERO PDFs (see
+// noPdfsButNeedsContext below) — the point is purely to decide whether to
+// show a "please select a PDF" warning instead of just answering as
+// general chat. Precision is prioritized over recall: only strong,
+// unambiguous document-reference terms are matched, since a false
+// positive here blocks an otherwise-normal conversation with an
+// unnecessary warning, while a false negative just falls through to
+// general chat — a much smaller UX cost. (Previously this list included
+// generic words like "this", "explain", "summary", "content", "text",
+// "describe", "about the", "in the", "from the", which matched huge
+// swaths of ordinary conversation.)
+const ENGLISH_DOCUMENT_KEYWORDS = [
+  "document", "pdf", "file", "page", "pages", "section", "chapter",
+  "uploaded", "attachment", "attached",
+];
+// Word-boundary matching (not substring) — the old `.includes()` check
+// matched "file" inside "profile" and "text" inside "context"/"textbook".
+const ENGLISH_DOCUMENT_KEYWORDS_RE = new RegExp(
+  `\\b(${ENGLISH_DOCUMENT_KEYWORDS.join("|")})\\b`,
+  "i"
+);
+// The app's primary users ask questions in Korean (see root CLAUDE.md) —
+// the English-only keyword list above never matched Korean questions at
+// all, so this safety net effectively never fired for real usage.
+const KOREAN_DOCUMENT_KEYWORDS = [
+  "문서", "파일", "피디에프", "페이지", "업로드", "첨부", "도안",
+];
+
 function needsDocumentContext(question: string): boolean {
-  const documentKeywords = [
-    "document", "pdf", "file", "page", "section", "chapter",
-    "according to", "based on", "what does", "what is", "explain",
-    "summarize", "summary", "tell me about", "describe", "definition",
-    "content", "text", "says", "mentioned", "states", "written",
-    "this", "the document", "the file", "the pdf", "uploaded",
-    "in the", "from the", "about the"
-  ];
-  
-  const lowerQuestion = question.toLowerCase();
-  return documentKeywords.some(keyword => lowerQuestion.includes(keyword));
+  if (ENGLISH_DOCUMENT_KEYWORDS_RE.test(question)) {
+    return true;
+  }
+  return KOREAN_DOCUMENT_KEYWORDS.some((keyword) => question.includes(keyword));
 }
 
 export async function POST(request: Request) {
