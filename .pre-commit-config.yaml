@@ -3,7 +3,7 @@ repos:
     hooks:
     -   id: python-tests
         name: Python Tests
-        entry: python -m unittest discover tests
+        entry: python -m pytest tests/
         language: system
         pass_filenames: false
         always_run: true

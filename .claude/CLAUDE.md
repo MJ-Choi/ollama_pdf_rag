@@ -68,7 +68,7 @@ python -m pytest tests/ --cov=src
 python -m pytest tests/test_ocr_pipeline.py -v          # 단일 파일
 python -m pytest tests/test_rag.py::test_specific_case  # 단일 테스트
 
-# pre-commit (주의: pytest가 아니라 `unittest discover tests` + pylint를 실행함)
+# pre-commit (pytest + pylint 실행 — 2026-07-23부터 CI와 동일하게 pytest 사용)
 pre-commit install
 pre-commit run --all-files
 ```
@@ -212,5 +212,7 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 8. ✅ **(해결됨, 2026-07-23) `needsDocumentContext()` 키워드 분류기(route.ts)가 조잡** — "this", "explain" 등 광범위한 영어 키워드라 일반 대화도 문서 질문으로 오분류 가능
    - 조사 결과: 이 함수는 PDF를 **하나도 선택 안 한 상태**에서만 결과가 실제로 동작에 영향을 줌(선택된 PDF가 있으면 항상 RAG로 감) — 즉 "일반 대화인데 PDF 선택하라고 잘못 경고하는지"만 결정하는 안전장치. 원래 문서화된 문제 외에 코드 읽다가 실제 버그 2개를 추가로 발견: (1) `.includes()`가 **부분 문자열** 매칭이라 "file"이 "profile" 안에서도, "text"가 "context"/"textbook" 안에서도 매칭됨. (2) 키워드가 **전부 영어**라 이 앱의 실제 사용자(한국어로 질문, CLAUDE.md 참조)의 질문은 사실상 전혀 못 잡음 — 안전장치가 실질적으로 무효했음
    - 조치: `web-ui/app/(chat)/api/chat/route.ts`의 `needsDocumentContext()` — 키워드를 "document"/"pdf"/"file"/"page(s)"/"section"/"chapter"/"uploaded"/"attachment(ed)" 등 **명확한 문서 참조어로만** 축소(오탐 방지가 정확도보다 우선 — 여기서 오탐이 정상 대화를 막는 게 미탐보다 UX 비용이 더 큼), 정규식(`\b...\b`) 단어 경계 매칭으로 교체, 한국어 키워드("문서"/"파일"/"페이지"/"업로드"/"첨부"/"도안" 등) 추가. 실제 문서 질문 7개 + 오탐 유발했던 일반 대화 11개(부분 문자열 버그 케이스 포함) 총 18개 케이스로 검증, 전부 예상대로 동작
-9. **pre-commit이 pytest 대신 unittest 실행** — CI(pytest)와 불일치. `.pre-commit-config.yaml`의 entry를 pytest로 교체 검토
+9. ✅ **(해결됨, 2026-07-23) pre-commit이 pytest 대신 unittest 실행** — CI(pytest)와 불일치. `.pre-commit-config.yaml`의 entry를 pytest로 교체 검토
+   - 조사 결과: 단순 "다른 러너를 쓴다" 수준이 아니라, 실제로 **87개 테스트 중 9개만 실행**되고 있었음. `python -m unittest discover tests`는 `unittest.TestCase` 서브클래스만 수집하는데, 레거시 `test_rag.py`(9개)만 그 형태이고 `test_ocr_pipeline.py`(이번 세션 OCR/번역/재-OCR 검증 로직 대부분), `test_document.py`, `test_models.py`, `test_pdf_service.py`의 pytest 스타일 함수 테스트 78개는 조용히 전부 스킵됨 — pre-commit이 사실상 회귀 방지 역할을 거의 못 하고 있었음(직접 실행해서 확인: `python -m unittest discover tests -v` → "Ran 9 tests")
+   - 조치: `.pre-commit-config.yaml`의 `python-tests` 훅 entry를 `python -m unittest discover tests` → `python -m pytest tests/`로 교체. CI와 동일한 러너로 통일되어 87개 전체가 실행됨. 직접 `python -m pytest tests/` 실행해 87개 전부 통과 확인(pre-commit CLI 자체는 미설치 환경이라, `language: system` 훅이 그대로 셸에서 실행하는 동일 명령으로 검증)
 10. **API 응답에 기계판독용 `truncated` 플래그 없음** — 현재는 답변 텍스트의 ⚠️ 문구로만 표시. `metadata` dict에 boolean 추가하면 UI가 활용 가능
