@@ -24,13 +24,13 @@ def query_pdfs(
     # Query RAG
     logger.info("🚀 Starting RAG query...")
     try:
-        answer, sources, reasoning_steps = rag_service.query_multi_pdf(
+        answer, sources, reasoning_steps, truncated = rag_service.query_multi_pdf(
             question=request.question,
             model=request.model,
             pdf_ids=request.pdf_ids,
             db=db
         )
-        logger.info(f"✅ RAG query complete: answer_length={len(answer)}, sources_count={len(sources)}, reasoning_steps={len(reasoning_steps)}")
+        logger.info(f"✅ RAG query complete: answer_length={len(answer)}, sources_count={len(sources)}, reasoning_steps={len(reasoning_steps)}, truncated={truncated}")
     except Exception as e:
         error_msg = str(e)
         if "not found" in error_msg.lower() and "404" in error_msg:
@@ -49,7 +49,8 @@ def query_pdfs(
             "model_used": request.model,
             "chunks_retrieved": len(sources),
             "pdfs_queried": len(set(s["pdf_id"] for s in sources)),
-            "reasoning_steps": reasoning_steps
+            "reasoning_steps": reasoning_steps,
+            "truncated": truncated
         }
     )
 

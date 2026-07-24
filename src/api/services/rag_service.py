@@ -761,7 +761,7 @@ class RAGService:
         model: str,
         pdf_ids: Optional[List[str]],
         db: Session
-    ) -> Tuple[str, List[Dict], List[str]]:
+    ) -> Tuple[str, List[Dict], List[str], bool]:
         """Query across multiple PDFs with source attribution.
 
         Args:
@@ -771,7 +771,15 @@ class RAGService:
             db: Database session
 
         Returns:
-            Tuple of (answer, sources, reasoning_steps)
+            Tuple of (answer, sources, reasoning_steps, truncated). `truncated`
+            is a machine-readable counterpart to the ⚠️ warning already
+            appended to `answer` text when the response was cut off (Ollama's
+            done_reason never reached "stop" even after continuation
+            retries) or when one or more pages permanently failed after
+            MAX_PAGE_RETRY_ATTEMPTS — so callers (e.g. the API layer) don't
+            have to string-match the answer text to detect an incomplete
+            response. False for every metadata/raw-content short-circuit
+            path, since those are never LLM-generated and can't be truncated.
         """
         reasoning_steps = []
 
@@ -782,7 +790,7 @@ class RAGService:
         pdfs = query.all()
 
         if not pdfs:
-            return "No PDFs found to query.", [], []
+            return "No PDFs found to query.", [], [], False
 
         reasoning_steps.append(f"📚 Searching across {len(pdfs)} PDF(s): {', '.join([p.name for p in pdfs])}")
 
@@ -799,7 +807,7 @@ class RAGService:
                     for pdf in pdfs
                 ]
                 reasoning_steps.append("✨ Answer generated successfully!")
-                return answer, sources, reasoning_steps
+                return answer, sources, reasoning_steps, False
 
         # An explicit "중국어 도안을 한국어로 번역해줘"-style question narrows OCR to
         # just the named source+target languages for THIS query (re-OCR from the
@@ -961,7 +969,7 @@ class RAGService:
                     for doc in all_docs
                 ]
                 reasoning_steps.append("✨ Answer generated successfully!")
-                return answer, sources, reasoning_steps
+                return answer, sources, reasoning_steps, False
 
         # In full-document mode, use every chunk; otherwise keep the
         # existing top-10 cap for retrieval-based (large corpus) mode.
@@ -1121,7 +1129,8 @@ Think through each step carefully, showing your reasoning process."""
             response = response + "\n\n⚠️ [참고: 이 답변은 완전히 생성되지 못했을 수 있습니다 — 응답이 중간에 잘렸습니다.]"
             reasoning_steps.append("⚠️ 답변이 불완전하게 생성되었습니다 (이어쓰기 시도 후에도 완료되지 않음)")
 
-        if not failed_pages and not truncated:
+        is_incomplete = bool(failed_pages) or truncated
+        if not is_incomplete:
             reasoning_steps.append("✨ Answer generated successfully!")
 
-        return response, sources, reasoning_steps
+        return response, sources, reasoning_steps, is_incomplete

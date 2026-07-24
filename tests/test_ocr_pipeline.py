@@ -377,7 +377,7 @@ def test_query_multi_pdf_answers_page_count_without_llm():
     db = MagicMock()
     db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
 
-    answer, sources, reasoning_steps = service.query_multi_pdf(
+    answer, sources, reasoning_steps, truncated = service.query_multi_pdf(
         question="이 pdf는 총 몇 페이지야?", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
     )
 
@@ -416,7 +416,7 @@ def test_query_multi_pdf_answers_filename_without_llm():
     db = MagicMock()
     db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
 
-    answer, sources, reasoning_steps = service.query_multi_pdf(
+    answer, sources, reasoning_steps, truncated = service.query_multi_pdf(
         question="이 파일 이름이 뭐야?", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
     )
 
@@ -437,7 +437,7 @@ def test_query_multi_pdf_answers_upload_date_without_llm():
     db = MagicMock()
     db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
 
-    answer, sources, reasoning_steps = service.query_multi_pdf(
+    answer, sources, reasoning_steps, truncated = service.query_multi_pdf(
         question="이거 언제 업로드했어?", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
     )
 
@@ -457,7 +457,7 @@ def test_query_multi_pdf_answers_chunk_count_without_llm():
     db = MagicMock()
     db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
 
-    answer, sources, reasoning_steps = service.query_multi_pdf(
+    answer, sources, reasoning_steps, truncated = service.query_multi_pdf(
         question="청크 수가 몇 개야?", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
     )
 
@@ -500,7 +500,7 @@ def test_query_multi_pdf_answers_page_range_raw_content_without_llm():
 
     with patch("src.api.services.rag_service.Chroma", return_value=fake_vector_db), \
          patch("src.api.services.rag_service.OllamaEmbeddings"):
-        answer, sources, reasoning_steps = service.query_multi_pdf(
+        answer, sources, reasoning_steps, truncated = service.query_multi_pdf(
             question="1~2페이지 내용을 알려줘", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
         )
 
@@ -510,6 +510,82 @@ def test_query_multi_pdf_answers_page_range_raw_content_without_llm():
     assert len(sources) == 2
     assert any("페이지 범위 감지" in s for s in reasoning_steps)
     assert any("LLM 호출 없음" in s for s in reasoning_steps)
+    assert truncated is False  # never LLM-generated, so can't be truncated
+
+
+def test_query_multi_pdf_metadata_shortcut_returns_truncated_false():
+    # Machine-readable counterpart to the answer text's ⚠️ warning (see
+    # rag_service.query_multi_pdf docstring) — metadata short-circuits are
+    # never LLM-generated, so `truncated` must always be False for them.
+    from types import SimpleNamespace
+
+    service = RAGService()
+    fake_pdf = SimpleNamespace(name="test.pdf", pdf_id="pdf_1", page_count=11, doc_count=11)
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
+
+    _, _, _, truncated = service.query_multi_pdf(
+        question="이 pdf는 총 몇 페이지야?", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
+    )
+    assert truncated is False
+
+
+def test_query_multi_pdf_propagates_truncated_flag_from_translate_pages():
+    from types import SimpleNamespace
+
+    service = RAGService()
+    fake_pdf = SimpleNamespace(
+        name="test.pdf", pdf_id="pdf_1", page_count=2, doc_count=2,
+        collection_name="col_1", file_path=None,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
+
+    fake_vector_db = MagicMock()
+    fake_vector_db.get.return_value = {
+        "documents": ["page 1 content", "page 2 content"],
+        "metadatas": [{"source_page": 1}, {"source_page": 2}],
+    }
+
+    with patch("src.api.services.rag_service.Chroma", return_value=fake_vector_db), \
+         patch("src.api.services.rag_service.OllamaEmbeddings"), \
+         patch.object(RAGService, "_translate_pages", return_value=("번역 결과", True, [])):
+        answer, _, _, truncated = service.query_multi_pdf(
+            question="이 문서를 한국어로 번역해줘", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
+        )
+
+    assert truncated is True
+    assert "완전히 생성되지 못했을 수 있습니다" in answer  # text warning still present too
+
+
+def test_query_multi_pdf_propagates_truncated_flag_from_failed_pages():
+    # A permanently-failed page (see _translate_pages) also makes the
+    # overall answer incomplete, even if `truncated` itself is False.
+    from types import SimpleNamespace
+
+    service = RAGService()
+    fake_pdf = SimpleNamespace(
+        name="test.pdf", pdf_id="pdf_1", page_count=2, doc_count=2,
+        collection_name="col_1", file_path=None,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
+
+    fake_vector_db = MagicMock()
+    fake_vector_db.get.return_value = {
+        "documents": ["page 1 content", "page 2 content"],
+        "metadatas": [{"source_page": 1}, {"source_page": 2}],
+    }
+
+    with patch("src.api.services.rag_service.Chroma", return_value=fake_vector_db), \
+         patch("src.api.services.rag_service.OllamaEmbeddings"), \
+         patch.object(RAGService, "_translate_pages", return_value=("페이지1 결과", False, [2])):
+        answer, _, _, truncated = service.query_multi_pdf(
+            question="이 문서를 한국어로 번역해줘", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
+        )
+
+    assert truncated is True
+    assert "처리하지 못했습니다" in answer
 
 
 def test_estimate_num_ctx_floor_applies_regardless_of_output_budget():
