@@ -43,6 +43,14 @@ import { join } from "path";
 // Use SQLite instead of PostgreSQL for local development
 const dbPath = join(process.cwd(), "data", "chat.db");
 const sqlite = new Database(dbPath);
+// Default rollback-journal mode has readers block writers, so the sidebar's
+// frequent polling (/api/history, /api/vote, /api/auth/session) racing a
+// write (e.g. deleteChatById) can throw "database is locked" — observed live
+// as an uncaught 500 on DELETE /api/chat. WAL lets reads and writes proceed
+// concurrently; busy_timeout makes any remaining lock contention retry
+// instead of failing immediately.
+sqlite.pragma("journal_mode = WAL");
+sqlite.pragma("busy_timeout = 5000");
 const db = drizzle(sqlite);
 
 export async function getUser(email: string): Promise<User[]> {
@@ -53,6 +61,14 @@ export async function getUser(email: string): Promise<User[]> {
       "bad_request:database",
       "Failed to get user by email"
     );
+  }
+}
+
+export async function getUserById(id: string): Promise<User[]> {
+  try {
+    return await db.select().from(user).where(eq(user.id, id));
+  } catch (_error) {
+    throw new ChatSDKError("bad_request:database", "Failed to get user by id");
   }
 }
 
@@ -118,7 +134,8 @@ export async function deleteChatById({ id }: { id: string }) {
       .where(eq(chat.id, id))
       .returning();
     return chatsDeleted;
-  } catch (_error) {
+  } catch (error) {
+    console.error(`deleteChatById failed for id: ${id}`, error);
     throw new ChatSDKError(
       "bad_request:database",
       "Failed to delete chat by id"
@@ -241,7 +258,8 @@ export async function getChatById({ id }: { id: string }) {
     }
 
     return selectedChat;
-  } catch (_error) {
+  } catch (error) {
+    console.error(`getChatById failed for id: ${id}`, error);
     throw new ChatSDKError("bad_request:database", "Failed to get chat by id");
   }
 }

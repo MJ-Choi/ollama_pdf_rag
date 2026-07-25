@@ -2,9 +2,19 @@ import { compare } from "bcrypt-ts";
 import NextAuth, { type DefaultSession } from "next-auth";
 import type { DefaultJWT } from "next-auth/jwt";
 import Credentials from "next-auth/providers/credentials";
+import { cookies } from "next/headers";
 import { DUMMY_PASSWORD } from "@/lib/constants";
-import { createGuestUser, getUser } from "@/lib/db/queries";
+import { createGuestUser, getUser, getUserById } from "@/lib/db/queries";
 import { authConfig } from "./auth.config";
+
+// Separate from the NextAuth session cookie so guest identity survives a
+// session-cookie rotation (JWT expiry, browser cookie clearing on the auth
+// cookie specifically, etc.) — without this, every re-login mints a brand
+// new guest `user` row, and any chat created under the old guest id becomes
+// permanently un-deletable (chat.userId can never match the new session's
+// user.id again). ~400 days is the practical browser-enforced cookie cap.
+const GUEST_ID_COOKIE = "guest-user-id";
+const GUEST_ID_COOKIE_MAX_AGE = 60 * 60 * 24 * 400;
 
 export type UserType = "guest" | "regular";
 
@@ -69,7 +79,25 @@ export const {
       id: "guest",
       credentials: {},
       async authorize() {
+        const cookieStore = await cookies();
+        const existingGuestId = cookieStore.get(GUEST_ID_COOKIE)?.value;
+
+        if (existingGuestId) {
+          const [existingUser] = await getUserById(existingGuestId);
+          if (existingUser) {
+            return { ...existingUser, type: "guest" };
+          }
+          console.log(
+            `Guest cookie pointed at missing user ${existingGuestId}, creating a new guest identity`
+          );
+        }
+
         const [guestUser] = await createGuestUser();
+        cookieStore.set(GUEST_ID_COOKIE, guestUser.id, {
+          httpOnly: true,
+          maxAge: GUEST_ID_COOKIE_MAX_AGE,
+          sameSite: "lax",
+        });
         return { ...guestUser, type: "guest" };
       },
     }),

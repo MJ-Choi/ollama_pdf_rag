@@ -104,20 +104,36 @@ result = col.get(include=['documents', 'metadatas'])
 
 이 DB가 **이 프로젝트의 유일한 채팅 기록**이다 (백엔드 쪽 `chat_sessions`/`messages`는 위 참조, 2026-07-23 제거됨). 사이드바 대화 목록, 대화 재개, 삭제, 제목 생성이 전부 이 DB를 실시간으로 읽고 쓴다.
 
+### 연결 설정 (`lib/db/queries.ts`)
+```typescript
+const sqlite = new Database(dbPath);
+sqlite.pragma("journal_mode = WAL");
+sqlite.pragma("busy_timeout = 5000");
+```
+(2026-07-25 추가) 기본 rollback-journal 모드는 읽기가 쓰기를 막아서, 사이드바의 잦은 폴링(`/api/history`, `/api/vote`, `/api/auth/session`)이 삭제 같은 쓰기와 겹치면 SQLite가 즉시 "database is locked"로 실패했다 — 실측: `DELETE /api/chat`가 처리되지 않은 예외로 500이 나면서 채팅이 실제로는 안 지워졌는데도 프론트가 성공으로 오인하는 버그의 근본 원인이었음(아래 `chat`/`user` 알려진 이슈 참조). WAL은 읽기/쓰기를 동시에 허용하고, `busy_timeout`은 그래도 남는 락 경합을 즉시 실패 대신 재시도하게 한다.
+
 ### 테이블
 
 | 테이블 | 주요 컬럼 | 설명 |
 |---|---|---|
-| `chat` | `id`(PK), `created_at`, `title`, `visibility`, `user_id` | 대화(세션) 1개 = 행 1개. `user_id` 기본값 `"local-user"`(인증 없는 로컬 개발 가정) |
+| `chat` | `id`(PK), `created_at`, `title`, `visibility`, `user_id`(FK→user) | 대화(세션) 1개 = 행 1개. `user_id`는 생성 시점(`route.ts` POST 핸들러)에 항상 `session.user.id`(로그인된 실제 user id)로 명시적으로 채워짐 — 스키마 기본값 `"local-user"`는 이 값을 지정하지 않고 직접 insert할 때만 쓰이는 폴백이고, 정상 흐름에서는 실제로 쓰이지 않음 |
 | `message` | `id`(PK), `chat_id`(FK→chat), `role`, `content`(레거시 호환용), `parts`(AI SDK 메시지 파츠, JSON 문자열), `created_at` | 채팅 메시지 1개 = 행 1개 |
 | `chat_pdf` | `chat_id`(FK→chat), `pdf_id`, `added_at` | 이 프로젝트 전용 테이블 — 특정 대화에 선택된 PDF(백엔드 `pdf_id`)를 연결. PK 없음(복합키 없이 단순 로그성 테이블) |
-| `user` | `id`(PK), `email`, `password`, `created_at` | 템플릿 잔재 — Vercel AI Chatbot 템플릿 호환용 스텁, 이 프로젝트는 인증 없이 `local-user` 고정 사용 |
+| `user` | `id`(PK), `email`, `password`, `created_at` | Vercel AI Chatbot 템플릿에서 가져온 테이블이지만, **템플릿 잔재가 아니라 실제로 쓰인다** — NextAuth(`app/(auth)/auth.ts`)가 매 요청 세션을 이 테이블의 실제 행과 연결한다. 아래 "게스트 사용자 영속성" 참조 |
 | `document` | `id`(PK), `title`, `content`, `kind`, `user_id`(FK→user), `created_at` | 템플릿의 아티팩트(코드/텍스트/시트/이미지 사이드패널) 기능용 — PDF RAG 흐름과 무관 |
 | `suggestion` | `id`(PK), `document_id`(FK→document), `document_created_at`, `content`, `user_id`(FK→user), `created_at` | 아티팩트 기능용, 템플릿 잔재 |
 | `vote` | `chat_id`(FK→chat), `message_id`, `is_upvoted` | 메시지 좋아요/싫어요, 템플릿 잔재 |
 | `stream` | `id`(PK), `chat_id`(FK→chat), `content`, `created_at` | 스트리밍 재개용, 템플릿 잔재 |
 
-`user`/`document`/`suggestion`/`vote`/`stream`은 Vercel AI Chatbot 템플릿에서 그대로 가져온 것으로, 이 프로젝트의 핵심 흐름(PDF RAG 채팅)에는 `chat`/`message`/`chat_pdf`만 실질적으로 쓰인다.
+`document`/`suggestion`/`vote`/`stream`은 Vercel AI Chatbot 템플릿에서 그대로 가져와 이 프로젝트의 핵심 흐름(PDF RAG 채팅)엔 안 쓰이지만, `user`는 인증에 실제로 쓰인다는 점에 주의.
+
+### 게스트 사용자 영속성 (`user` 테이블, 2026-07-25 추가)
+
+이 앱은 회원가입 없이 쓰는 로컬 툴이라 대부분 NextAuth의 **guest** Credentials 프로바이더(`app/(auth)/auth.ts`)로 자동 로그인된다 — 로그인 세션이 없을 때(`app/(chat)/page.tsx`가 `redirect("/api/auth/guest")`) `createGuestUser()`가 `user` 테이블에 새 행(`email: guest-<timestamp>`)을 만들고, 이 행의 `id`가 그 세션의 `session.user.id`가 되어 `chat.user_id`로 저장된다.
+
+- ⚠️ **(2026-07-25 수정 전 버그)** 게스트 로그인 세션(NextAuth JWT 쿠키)이 만료되거나 지워지면, `createGuestUser()`가 매번 **완전히 새로운** `user` 행 + 새 id를 만들었다 — 그러면 이전 세션에서 만든 채팅의 `chat.user_id`는 다시는 로그인될 수 없는 "죽은" 게스트 id로 영구히 고정되어, `DELETE /api/chat`의 소유자 검사(`chat.userId !== session.user.id`)를 그 무엇으로도 통과할 수 없게 되고(항상 403), 삭제가 영구히 불가능해짐. 실측: `data/chat.db`에 `chat.user_id`가 `user` 테이블 어디에도 없는 고아 채팅이 발견됨
+- ✅ **수정**: `auth.ts`의 guest `authorize()`가 이제 NextAuth 세션 쿠키와는 별도의 장기 쿠키(`guest-user-id`, httpOnly, `sameSite: lax`, 약 400일)를 확인해서, 있으면 기존 게스트 `user` 행을 재사용하고 없을 때만 새로 만든다 — 같은 브라우저는 인증 세션이 끊겨도 동일한 `user.id`를 유지하므로 예전 채팅이 계속 삭제 가능
+- `getUserById(id)`(`lib/db/queries.ts`) — 이 영속성 로직을 위해 추가된 조회 함수(기존엔 `getUser(email)`만 있었음)
 
 ### 명령어
 ```bash
@@ -130,5 +146,6 @@ pnpm db:studio     # Drizzle Studio GUI로 직접 조회
 대안: `npx tsx web-ui/lib/db/init-db.ts` (빈 DB 초기화), `web-ui/init-db.sh` (⚠️ `data/chat.db`와 `lib/db/migrations` 전체 삭제 후 재생성 — 파괴적)
 
 ### 알려진 이슈
-- 템플릿 잔재 테이블(`user`~`stream`)이 이 프로젝트에서 쓰이지 않는 기능(아티팩트, 투표, 인증)을 위한 것이라 스키마가 실제 사용 범위보다 큼 — 정리 여부는 별도 판단 필요
+- 템플릿 잔재 테이블(`document`/`suggestion`/`vote`/`stream`)이 이 프로젝트에서 쓰이지 않는 기능(아티팩트, 투표)을 위한 것이라 스키마가 실제 사용 범위보다 큼 — 정리 여부는 별도 판단 필요
 - `.env.example`에 Vercel 전용 변수(`AI_GATEWAY_API_KEY`, `BLOB_READ_WRITE_TOKEN`, `POSTGRES_URL`, `REDIS_URL`)가 템플릿에서 그대로 남아있음 — 로컬 개발엔 `NEXT_PUBLIC_API_URL`, `AUTH_SECRET`, DB 경로만 필요
+- `route.ts`의 `DELETE`/`lib/db/queries.ts`의 `deleteChatById`/`getChatById`에 로깅 추가됨(2026-07-25) — 삭제 실패 시 요청 id·인증/소유자 검사 결과·원본 DB 에러가 서버 콘솔에 남는다. 삭제가 안 될 때는 먼저 이 로그로 어느 단계(미인증/404/403/DB 에러)에서 막혔는지 확인할 것

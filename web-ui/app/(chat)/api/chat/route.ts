@@ -380,7 +380,10 @@ export async function DELETE(request: Request) {
   const { searchParams } = new URL(request.url);
   const id = searchParams.get("id");
 
+  console.log("DELETE /api/chat requested for id:", id);
+
   if (!id) {
+    console.log("DELETE /api/chat rejected: no id parameter");
     return new ChatSDKError(
       "bad_request:api",
       "Parameter id is required."
@@ -390,20 +393,36 @@ export async function DELETE(request: Request) {
   const session = await auth();
 
   if (!session?.user?.id) {
+    console.log("DELETE /api/chat rejected: no authenticated session");
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
 
-  const chat = await getChatById({ id });
+  try {
+    const chat = await getChatById({ id });
 
-  if (!chat) {
-    return new ChatSDKError("not_found:chat").toResponse();
+    if (!chat) {
+      console.log(`DELETE /api/chat rejected: chat ${id} not found`);
+      return new ChatSDKError("not_found:chat").toResponse();
+    }
+
+    if (chat.userId !== session.user.id) {
+      console.log(
+        `DELETE /api/chat rejected: chat ${id} owned by ${chat.userId}, requested by ${session.user.id}`
+      );
+      return new ChatSDKError("forbidden:chat").toResponse();
+    }
+
+    const deletedChat = await deleteChatById({ id });
+    console.log(`DELETE /api/chat succeeded for id: ${id}`);
+
+    return Response.json(deletedChat, { status: 200 });
+  } catch (error) {
+    console.error(`DELETE /api/chat failed unexpectedly for id: ${id}`, error);
+
+    if (error instanceof ChatSDKError) {
+      return error.toResponse();
+    }
+
+    return new ChatSDKError("bad_request:database", "Failed to delete chat").toResponse();
   }
-
-  if (chat.userId !== session.user.id) {
-    return new ChatSDKError("forbidden:chat").toResponse();
-  }
-
-  const deletedChat = await deleteChatById({ id });
-
-  return Response.json(deletedChat, { status: 200 });
 }
