@@ -161,23 +161,23 @@ VERBATIM_INSTRUCTIONS = (
 # required structure so every page follows the same, unambiguous format.
 TRANSLATION_LINE_INSTRUCTIONS = (
     "Reproduce AND translate the source text below, line by line, in its original "
-    "order. For EVERY line of source content, output exactly two lines in this "
-    "order: (1) the original source line, unmodified, then (2) immediately below "
-    "it, its translation. Repeat this original-then-translation pair for every "
-    "single line in the source, all the way through — never batch all original "
-    "lines together followed by all translations as separate blocks, never merge "
-    "multiple original lines into one translated line, and never skip translating "
-    "a line. Do NOT summarize, paraphrase, deduplicate, or reorganize by topic — "
-    "preserve the exact order and every line, including row/section labels (e.g. "
-    "R1, R2, 耳部). A standalone section-title/heading line (e.g. 耳朵（做2个）：, "
-    "with no row number) follows the EXACT SAME rule as every other line: it "
-    "gets its own original-then-translation pair before moving on to the next "
-    "line — never left untranslated, never merged with the line that follows it, "
-    "and never skipped just because it's a heading rather than a numbered row. "
-    "Only insert a source label (e.g. [Source: filename]) when "
-    "switching between different source documents. If a PRIORITY REFERENCE "
-    "CONTEXT section appears above, its term mappings are mandatory for your "
-    "translation — use its exact wording for any matching term instead of your "
+    "order, using EXACTLY this two-section structure — nothing before, between, "
+    "or after these two sections:\n\n"
+    "# 원문:\n"
+    "[every source line, verbatim, one per line, in original order — every row/section "
+    "label included, e.g. R1, R2, 耳部, and standalone section-title/heading lines "
+    "with no row number]\n\n"
+    "# 결과:\n"
+    "[every line's translation, one per line, in THE SAME ORDER as the 원문 section — "
+    "line N of 결과 must be the translation of line N of 원문, with no lines skipped, "
+    "merged, or reordered]\n\n"
+    "Do NOT summarize, paraphrase, deduplicate, or reorganize by topic. Do NOT "
+    "interleave an original line with its translation — all original lines belong "
+    "in the # 원문 section, all translations in the # 결과 section, never mixed line "
+    "by line. Only insert a source label (e.g. [Source: filename]) at the very top, "
+    "before # 원문, when switching between different source documents. If a PRIORITY "
+    "REFERENCE CONTEXT section appears above, its term mappings are mandatory for "
+    "your translation — use its exact wording for any matching term instead of your "
     "own phrasing, even if your own phrasing seems equally correct. Apply each "
     "mapping literally per occurrence of that exact source text — do NOT "
     "generalize a compound term's mapping to a different, standalone "
@@ -191,15 +191,16 @@ TRANSLATION_LINE_INSTRUCTIONS = (
     "Example of the required STRUCTURE only (the actual terms below are "
     "placeholders — do NOT reuse this exact wording; always prefer the "
     "priority reference context's terms for real content):\n"
+    "# 원문:\n"
     "[source heading line, no row number]\n"
-    "[translation of the heading line]\n"
     "R1 : [source line A]\n"
+    "R2 : [source line B]\n\n"
+    "# 결과:\n"
+    "[translation of the heading line]\n"
     "R1: [translation of line A]\n"
-    "R2 : [source line B]\n"
     "R2: [translation of line B]\n"
-    "Follow this exact interleaving pattern for every line below — heading "
-    "lines included, exactly like the first pair above — and do not repeat "
-    "any line or block twice."
+    "Follow this exact two-section pattern for every line below, and do not "
+    "repeat any line or block twice."
 )
 
 
@@ -435,23 +436,29 @@ def _wants_raw_page_content(question: str) -> bool:
 _HANGUL_RE = re.compile(r'[가-힣]')
 
 
-def _looks_correctly_interleaved(text: str) -> bool:
-    """False if a translation-mode response looks like a block of original
-    lines followed by a separate block of translated (Hangul) lines, or
-    contains no Hangul at all despite translation being requested."""
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    if len(lines) < 4:
-        return True  # too short to meaningfully judge structure
-    has_hangul = [bool(_HANGUL_RE.search(ln)) for ln in lines]
-    if not any(has_hangul):
-        return False  # no translation anywhere
-    midpoint = len(lines) // 2
-    first_half_ratio = sum(has_hangul[:midpoint]) / midpoint
-    second_half_ratio = sum(has_hangul[midpoint:]) / (len(lines) - midpoint)
-    # Properly interleaved output has translated lines spread roughly evenly
-    # throughout; almost-none-then-mostly is the "all originals, then all
-    # translations" block failure mode.
-    return not (first_half_ratio < 0.15 and second_half_ratio > 0.6)
+# Required output shape (2026-07-25): a single "# 원문:" block of every
+# source line, followed by a single "# 결과:" block of every translation, in
+# the same order — replacing the earlier per-line original-then-translation
+# interleaving this app used until now. (That older format is exactly what
+# _looks_duplicated's docstring and this function's predecessor,
+# _looks_correctly_interleaved, used to treat as the bug to catch — this is
+# a deliberate reversal, not a regression.)
+_ORIGINAL_HEADING_RE = re.compile(r'^#\s*원문\s*:?', re.MULTILINE)
+_RESULT_HEADING_RE = re.compile(r'^#\s*결과\s*:?', re.MULTILINE)
+
+
+def _looks_correctly_structured(text: str) -> bool:
+    """False if a translation-mode response doesn't have a "# 원문:" section
+    followed by a "# 결과:" section, or the 결과 section has no Hangul
+    translation content at all."""
+    original_match = _ORIGINAL_HEADING_RE.search(text)
+    result_match = _RESULT_HEADING_RE.search(text)
+    if not (original_match and result_match):
+        return False
+    if result_match.start() <= original_match.start():
+        return False  # 결과 must come after 원문, not before/instead of it
+    result_section = text[result_match.end():]
+    return bool(_HANGUL_RE.search(result_section))
 
 
 def _looks_duplicated(text: str) -> bool:
@@ -508,8 +515,9 @@ def _expects_korean_output(question: str) -> bool:
 def _looks_untranslated_output(text: str) -> bool:
     """True if a Korean-target translation response contains (almost) no
     Hangul lines — i.e. the model answered in the wrong language entirely,
-    or skipped translating. A correctly interleaved Chinese→Korean page has
-    Hangul on roughly half its lines; an English/Chinese-only page has ~0."""
+    or skipped translating. A correctly structured Chinese→Korean page has
+    Hangul on roughly half its lines (the whole # 결과 section); an
+    English/Chinese-only page has ~0."""
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if len(lines) < 4:
         return False  # too short to judge reliably
@@ -756,8 +764,9 @@ class RAGService:
 
         A page can also exhaust every retry while still producing SOME output
         that just never passes format validation (duplicated / wrong-language /
-        non-interleaved) — e.g. the model keeps echoing the source verbatim
-        instead of translating it. That page's last attempt is kept (not
+        missing the required "# 원문:"/"# 결과:" structure) — e.g. the model
+        keeps echoing the source verbatim instead of translating it. That
+        page's last attempt is kept (not
         discarded, same "never lose completed work" policy as a hard failure)
         but is now marked inline in the returned text — previously this only
         showed up as a reasoning_steps entry the caller never surfaced, so a
@@ -819,8 +828,8 @@ class RAGService:
                         format_issue = "응답이 중복 생성됨"
                     elif _expects_korean_output(question) and _looks_untranslated_output(page_text):
                         format_issue = "요청한 언어(한국어)로 번역되지 않음"
-                    elif not _looks_correctly_interleaved(page_text):
-                        format_issue = "원문/번역이 줄 단위로 교차되지 않음"
+                    elif not _looks_correctly_structured(page_text):
+                        format_issue = "'# 원문:'/'# 결과:' 구조를 따르지 않음"
 
                 if last_error is None and format_issue is None:
                     break  # success
@@ -851,20 +860,21 @@ class RAGService:
                         correction = (
                             f"That output was rejected: {format_issue}. Your "
                             "translation lines were not in Korean. Redo this "
-                            "page from scratch. EVERY translation line must "
-                            "be written in Korean (한글/Hangul) — not English, "
-                            "not the source language, not romanized. Keep the "
-                            "same original-line-then-translation-line "
-                            "interleaved format, with no duplicated content."
+                            "page from scratch. EVERY line in the # 결과 "
+                            "section must be written in Korean (한글/Hangul) — "
+                            "not English, not the source language, not "
+                            "romanized. Keep the same '# 원문:' / '# 결과:' "
+                            "two-section format, with no duplicated content."
                         )
                     else:
                         correction = (
                             f"That output was rejected: {format_issue}. Redo this page "
-                            "from scratch following the exact original-line-then-"
-                            "translation-line interleaved format shown earlier, with "
-                            "no duplicated content, translating into the language the "
-                            "user asked for (한국어, unless they explicitly requested "
-                            "another language)."
+                            "from scratch following the exact '# 원문:' / '# 결과:' "
+                            "two-section format shown earlier (all source lines under "
+                            "# 원문, all translations in the same order under # 결과), "
+                            "with no duplicated content, translating into the language "
+                            "the user asked for (한국어, unless they explicitly "
+                            "requested another language)."
                         )
                     attempt_messages = messages + [
                         AIMessage(content=page_text),
@@ -1139,8 +1149,8 @@ class RAGService:
         # through the per-page loop, including a single page — not just
         # "more than one page" as this used to require. _translate_pages()
         # is also where the only format validation lives (duplicate output,
-        # untranslated/wrong-language output, non-interleaved output), each
-        # with up to MAX_PAGE_RETRY_ATTEMPTS retries; the plain single-call
+        # untranslated/wrong-language output, missing "# 원문:"/"# 결과:"
+        # structure), each with up to MAX_PAGE_RETRY_ATTEMPTS retries; the plain single-call
         # path below has none of that. A single-page range request (e.g.
         # "11페이지만 번역해줘") used to skip validation entirely and could
         # silently return the original text completely untranslated with no

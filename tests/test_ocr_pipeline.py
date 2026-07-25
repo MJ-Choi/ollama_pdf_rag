@@ -22,7 +22,7 @@ from src.api.services.rag_service import (
     _expects_korean_output,
     _line_instructions_for,
     _detect_page_range,
-    _looks_correctly_interleaved,
+    _looks_correctly_structured,
     _looks_duplicated,
     _looks_untranslated_output,
     _normalize_korean_counts,
@@ -241,32 +241,43 @@ def test_detect_ocr_language_override_falls_back_to_cjk_default_without_two_lang
     assert _detect_ocr_language_override("한국어로 요약해줘") is None
 
 
-def test_looks_correctly_interleaved_true_for_alternating_lines():
+def test_looks_correctly_structured_true_for_proper_two_section_format():
+    # Current required format: a single "# 원문:" block of every source
+    # line, followed by a single "# 결과:" block of every translation.
+    text = "\n".join([
+        "# 원문:",
+        "R1 : 全下针", "R2 : 2下针，加针", "R3 : 全下针",
+        "",
+        "# 결과:",
+        "R1: 전체 아래뜨기", "R2: 2 아래뜨기, 코늘림", "R3: 전체 아래뜨기",
+    ])
+    assert _looks_correctly_structured(text) is True
+
+
+def test_looks_correctly_structured_false_for_missing_headers():
+    # Old per-line interleaved format (or any output missing the required
+    # headers entirely) no longer counts as correctly structured.
     text = "\n".join([
         "R1 : 全下针", "R1: 전체 아래뜨기",
         "R2 : 2下针，加针", "R2: 2 아래뜨기, 코늘림",
-        "R3 : 全下针", "R3: 전체 아래뜨기",
     ])
-    assert _looks_correctly_interleaved(text) is True
+    assert _looks_correctly_structured(text) is False
 
 
-def test_looks_correctly_interleaved_false_for_block_format():
-    # All-original lines first, then all-translated lines after — the
-    # observed "page 1" failure mode.
+def test_looks_correctly_structured_false_when_result_before_original():
     text = "\n".join([
-        "R1 : 全下针", "R2 : 2下针，加针", "R3 : 全下针", "R4 : 全下针",
-        "R1: 전체 아래뜨기", "R2: 2 아래뜨기, 코늘림", "R3: 전체 아래뜨기", "R4: 전체 아래뜨기",
+        "# 결과:", "R1: 전체 아래뜨기",
+        "# 원문:", "R1 : 全下针",
     ])
-    assert _looks_correctly_interleaved(text) is False
+    assert _looks_correctly_structured(text) is False
 
 
-def test_looks_correctly_interleaved_false_when_no_translation_present():
-    text = "\n".join(["R1 : 全下针", "R2 : 2下针，加针", "R3 : 全下针", "R4 : 全下针"])
-    assert _looks_correctly_interleaved(text) is False
-
-
-def test_looks_correctly_interleaved_true_for_short_text():
-    assert _looks_correctly_interleaved("R1 : 全下针") is True
+def test_looks_correctly_structured_false_when_no_translation_present():
+    text = "\n".join([
+        "# 원문:", "R1 : 全下针", "R2 : 2下针，加针",
+        "# 결과:", "R1 : 全下针", "R2 : 2下针，加针",  # untranslated, copied verbatim
+    ])
+    assert _looks_correctly_structured(text) is False
 
 
 def test_looks_duplicated_true_for_repeated_block():
@@ -391,9 +402,10 @@ def test_line_instructions_for_translation_request():
     # A Korean-target translation appends an explicit language directive on
     # top of the base instructions, so it's a superset, not an exact match.
     assert instructions.startswith(TRANSLATION_LINE_INSTRUCTIONS)
-    # The whole point of this instruction set: every line gets its own
-    # translation immediately below it, never batched into separate blocks.
-    assert "never batch all original lines" in instructions
+    # The whole point of this instruction set: a "# 원문:" block of every
+    # source line followed by a "# 결과:" block of every translation.
+    assert "# 원문:" in instructions
+    assert "# 결과:" in instructions
     assert "MUST be written in Korean" in instructions
 
 
@@ -757,12 +769,15 @@ def test_translate_pages_calls_once_per_page_in_order():
     ]
     service = RAGService()
 
+    # A non-translation (verbatim) request, so the "# 원문:"/"# 결과:" format
+    # validation this tests isn't about doesn't apply to these mock values —
+    # this test is purely about page-loop call mechanics.
     with patch.object(
         RAGService, "_invoke_with_continuation",
         side_effect=[("번역1", False), ("번역2", False), ("번역3", False)],
     ) as mock_invoke:
         result, truncated, failed_pages, format_issue_pages = service._translate_pages(
-            docs, "번역해줘", "qwen3:14b", []
+            docs, "그대로 나열해줘", "qwen3:14b", []
         )
 
     assert mock_invoke.call_count == 3
@@ -788,7 +803,7 @@ def test_translate_pages_propagates_truncation_from_any_page():
         side_effect=[("ok", False), ("cut off", True)],
     ):
         _, truncated, failed_pages, format_issue_pages = service._translate_pages(
-            docs, "번역해줘", "qwen3:14b", []
+            docs, "그대로 나열해줘", "qwen3:14b", []
         )
 
     assert truncated is True
@@ -806,7 +821,7 @@ def test_translate_pages_retries_a_hard_failure_then_succeeds():
         side_effect=[RuntimeError("unexpected EOF"), ("복구됨", False)],
     ) as mock_invoke:
         result, truncated, failed_pages, format_issue_pages = service._translate_pages(
-            docs, "번역해줘", "qwen3:14b", reasoning_steps
+            docs, "그대로 나열해줘", "qwen3:14b", reasoning_steps
         )
 
     assert mock_invoke.call_count == 2
@@ -837,7 +852,7 @@ def test_translate_pages_keeps_earlier_pages_when_a_later_page_fails_permanently
         ],
     ) as mock_invoke, patch("time.sleep"):
         result, truncated, failed_pages, format_issue_pages = service._translate_pages(
-            docs, "번역해줘", "qwen3:14b", reasoning_steps
+            docs, "그대로 나열해줘", "qwen3:14b", reasoning_steps
         )
 
     assert mock_invoke.call_count == 5
@@ -849,12 +864,18 @@ def test_translate_pages_keeps_earlier_pages_when_a_later_page_fails_permanently
     assert any("최종 실패" in s for s in reasoning_steps)
 
 
-_BLOCK_FORMAT_TEXT = "\n".join([
-    "R1 : 全下针", "R2 : 2下针，加针", "R3 : 全下针", "R4 : 全下针",
-    "R1: 전체 아래뜨기", "R2: 2 아래뜨기, 코늘림", "R3: 전체 아래뜨기", "R4: 전체 아래뜨기",
-])
-_INTERLEAVED_TEXT = "\n".join([
+# The required output format (see TRANSLATION_LINE_INSTRUCTIONS): a single
+# "# 원문:" block, then a single "# 결과:" block. The old per-line
+# interleaved format (no headers at all) is now the thing that must trigger
+# a retry, not the desired result.
+_MISSING_HEADERS_TEXT = "\n".join([
     "R1 : 全下针", "R1: 전체 아래뜨기", "R2 : 2下针，加针", "R2: 2 아래뜨기, 코늘림",
+])
+_TWO_SECTION_TEXT = "\n".join([
+    "# 원문:",
+    "R1 : 全下针", "R2 : 2下针，加针",
+    "# 결과:",
+    "R1: 전체 아래뜨기", "R2: 2 아래뜨기, 코늘림",
 ])
 
 
@@ -865,14 +886,14 @@ def test_translate_pages_retries_on_bad_format_then_succeeds():
 
     with patch.object(
         RAGService, "_invoke_with_continuation",
-        side_effect=[(_BLOCK_FORMAT_TEXT, False), (_INTERLEAVED_TEXT, False)],
+        side_effect=[(_MISSING_HEADERS_TEXT, False), (_TWO_SECTION_TEXT, False)],
     ) as mock_invoke:
         result, truncated, failed_pages, format_issue_pages = service._translate_pages(
             docs, "중국어를 한국어로 번역해줘", "qwen3:14b", reasoning_steps
         )
 
     assert mock_invoke.call_count == 2
-    assert result == _INTERLEAVED_TEXT
+    assert result == _TWO_SECTION_TEXT
     assert failed_pages == []
     assert format_issue_pages == []  # succeeded on retry, so no lingering issue
     assert any("형식 검증 실패" in s for s in reasoning_steps)
@@ -888,14 +909,14 @@ def test_translate_pages_keeps_result_when_format_issue_persists_after_retries()
 
     with patch.object(
         RAGService, "_invoke_with_continuation",
-        return_value=(_BLOCK_FORMAT_TEXT, False),
+        return_value=(_MISSING_HEADERS_TEXT, False),
     ) as mock_invoke:
         result, truncated, failed_pages, format_issue_pages = service._translate_pages(
             docs, "중국어를 한국어로 번역해줘", "qwen3:14b", reasoning_steps
         )
 
     assert mock_invoke.call_count == MAX_PAGE_RETRY_ATTEMPTS + 1
-    assert _BLOCK_FORMAT_TEXT in result  # kept despite the unresolved format issue
+    assert _MISSING_HEADERS_TEXT in result  # kept despite the unresolved format issue
     assert "번역 검증 실패" in result  # but now marked inline, not silently returned as-is
     assert failed_pages == []  # a format issue is not treated as a hard failure
     assert format_issue_pages == [1]  # ...but IS tracked separately for the caller
