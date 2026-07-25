@@ -1,18 +1,22 @@
 """Advanced text extraction for scanned/image-based PDFs.
 
 Features:
-- OCR extraction from image-based (scanned) PDFs, with watermark removal
+- OCR extraction from image-based (scanned) PDFs, via a vision-LLM
+  (deepseek-ocr:3b through Ollama), with watermark removal
 - Language detection
 - Quality metrics and preprocessing
 """
+import io
 import logging
 import re
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import ollama
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from PIL import Image
 
 from .image_analysis import ImageAnalyzer
 from .image_handler import ImageHandler
@@ -26,15 +30,50 @@ except ImportError:
     PDF2IMAGE_AVAILABLE = False
     logger.warning("pdf2image not installed. Image-based PDF processing will be limited.")
 
-try:
-    import pytesseract  # noqa: F401
-    TESSERACT_AVAILABLE = True
-except ImportError:
-    TESSERACT_AVAILABLE = False
-    logger.warning("pytesseract not installed. OCR functionality will be limited.")
-
 DEFAULT_OCR_LANGUAGE = "eng+chi_sim+chi_tra+kor"
 DEFAULT_DPI = 300
+
+# Vision-LLM OCR via Ollama, replacing pytesseract as of 2026-07-24 — live
+# comparison on the sample knitting-pattern PDF (11 pages) showed
+# deepseek-ocr:3b recognizing text pytesseract consistently got wrong or
+# missed entirely (misread CJK characters, unreadable watermark/caption
+# text treated as noise, text embedded in photos). No language parameter is
+# needed — the model reads whatever script is present — so `ocr_language`
+# is accepted by callers below purely for backward compatibility and is not
+# used by this path.
+DEEPSEEK_OCR_MODEL = "deepseek-ocr:3b"
+DEEPSEEK_OCR_PROMPT = (
+    "Extract ALL text from this image exactly as it appears, line by line, "
+    "preserving line breaks and original order. Do not translate, "
+    "summarize, or explain — output only the raw extracted text."
+)
+
+# deepseek-ocr formats its output as loose markdown and, on pages with photo
+# grids, sometimes emits the actual photo back as a base64-encoded data URI
+# reference (e.g. "[ref1]: data:image/png;base64,iVBORw0K...") — neither is
+# real page content; both must be stripped before the text reaches
+# chunking/embedding. The base64 payload itself is sometimes long enough
+# that the model line-wraps it — [A-Za-z0-9+/=\s]+ (not anchored to one
+# line) consumes the whole wrapped block, since CJK/punctuation characters
+# aren't in the base64 alphabet and naturally end the match where real text
+# resumes. A first version of this regex only matched a single line and, on
+# a wrapped payload, left the continuation lines (pure base64, no "data:"
+# prefix to match against) sitting in the stored text — inflating that one
+# page's chunk past the 7500-char splitter threshold and fragmenting it into
+# multiple garbage "pages" that then went through the full translation loop.
+_MARKDOWN_HEADER_RE = re.compile(r'^#{1,6}\s+', re.MULTILINE)
+_MARKDOWN_BOLD_RE = re.compile(r'\*\*(.+?)\*\*')
+_BASE64_IMAGE_RE = re.compile(
+    r'(\[ref\d*\]:\s*)?data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+',
+    re.IGNORECASE,
+)
+
+
+def _clean_deepseek_ocr_output(text: str) -> str:
+    text = _BASE64_IMAGE_RE.sub('', text)
+    text = _MARKDOWN_HEADER_RE.sub('', text)
+    text = _MARKDOWN_BOLD_RE.sub(r'\1', text)
+    return text
 
 # CJK-only OCR language pack (no "eng"). Mixing "eng" into Tesseract's
 # language set measurably degrades CJK recognition (e.g. "下针" misread as
@@ -160,7 +199,35 @@ class TextExtractor:
         self.image_handler = ImageHandler()
         self.image_analyzer = ImageAnalyzer()
         self.pdf2image_available = PDF2IMAGE_AVAILABLE
-        self.ocr_available = TESSERACT_AVAILABLE
+
+    def _extract_text_with_deepseek_ocr(self, image: Image.Image) -> str:
+        """Run the raw (unpreprocessed) page image through deepseek-ocr:3b.
+
+        No grayscale/denoise/Otsu preprocessing: that pipeline was tuned for
+        pytesseract's classical recognizer and, in live testing, the vision
+        model read watermarked/colored pages fine without it — preprocessing
+        would only risk destroying detail (e.g. in photo grids) a vision
+        model can actually use. Isolated per-page: a single page's OCR
+        failure logs and returns "" rather than aborting the whole document,
+        matching this pipeline's existing per-page resilience elsewhere
+        (e.g. _translate_pages).
+        """
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        try:
+            response = ollama.chat(
+                model=DEEPSEEK_OCR_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": DEEPSEEK_OCR_PROMPT,
+                    "images": [buffer.getvalue()],
+                }],
+                stream=False,
+            )
+        except Exception as e:
+            logger.error(f"deepseek-ocr extraction failed: {e}")
+            return ""
+        return _clean_deepseek_ocr_output(response.message.content or "")
 
     def extract_text_from_scanned_pdf(
         self,
@@ -174,12 +241,6 @@ class TextExtractor:
                 "pages": [], "total_pages": 0, "extraction_method": "failed",
                 "quality_metrics": {}, "languages_detected": [],
                 "error": "pdf2image not installed",
-            }
-        if not self.ocr_available:
-            return {
-                "pages": [], "total_pages": 0, "extraction_method": "failed",
-                "quality_metrics": {}, "languages_detected": [],
-                "error": "pytesseract not installed",
             }
 
         logger.info(f"Converting PDF to images: {file_path}")
@@ -198,11 +259,10 @@ class TextExtractor:
         for i, image in enumerate(images):
             page_number = (start_page or 1) + i
             logger.info(f"Processing page {page_number}")
-            preprocessed = self.image_handler.preprocess_for_ocr(image)
-            quality = self.image_analyzer.analyze_image_quality(preprocessed)
-            text = self.image_analyzer.extract_text_with_ocr(preprocessed, lang=ocr_language)
+            quality = self.image_analyzer.analyze_image_quality(image)
+            text = self._extract_text_with_deepseek_ocr(image)
             text = _collapse_cjk_spacing(text)
-            text_boxes = self.image_analyzer.extract_text_boxes(preprocessed, lang=ocr_language)
+            text_boxes: List[Dict] = []  # no per-word boxes/confidence from a vision-LLM
             language = self.image_analyzer.detect_language(text)
 
             confidence = self._calculate_confidence(text_boxes)

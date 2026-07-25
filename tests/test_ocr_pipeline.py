@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage
 
 from src.core.document import _check_single_char_pattern, _is_ocr_artifact_text, detect_if_image_based
 from src.core.image_handler import OPENCV_AVAILABLE, ImageHandler
-from src.core.text_extractor import _strip_recurring_watermark_lines
+from src.core.text_extractor import _clean_deepseek_ocr_output, _strip_recurring_watermark_lines
 from src.api.services.rag_service import (
     NUM_CTX_FLOOR,
     PAGE_TRANSLATION_OUTPUT_BUDGET,
@@ -160,6 +160,60 @@ def test_strip_recurring_watermark_lines_noop_for_too_few_pages():
     _strip_recurring_watermark_lines(pages)
     assert "请勿二改勿商用，转载标明出处" in pages[0]["text"]
     assert "请勿二改勿商用，转载标明出处" in pages[1]["text"]
+
+
+def test_clean_deepseek_ocr_output_strips_markdown_headers():
+    raw = "### 头部：\nR1 : 全下针\n## 备注"
+    cleaned = _clean_deepseek_ocr_output(raw)
+    assert "###" not in cleaned
+    assert "##" not in cleaned
+    assert "头部：" in cleaned
+    assert "R1 : 全下针" in cleaned
+
+
+def test_clean_deepseek_ocr_output_strips_base64_image_lines():
+    raw = (
+        "组装:\n"
+        "如图所示，缝合固定。\n"
+        "[ref1]: data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAABYCAYAAACK4D8W\n"
+        "藏好所有线头。"
+    )
+    cleaned = _clean_deepseek_ocr_output(raw)
+    assert "base64" not in cleaned
+    assert "data:image" not in cleaned
+    assert "组装:" in cleaned
+    assert "藏好所有线头。" in cleaned
+
+
+def test_clean_deepseek_ocr_output_strips_line_wrapped_base64():
+    # Regression test: a first version of the base64-stripping regex only
+    # matched a single line, so a payload the model wrapped across several
+    # lines left its continuation lines (pure base64, no "data:image"
+    # prefix to match against) behind in the stored text.
+    raw = (
+        "组装:\n"
+        "[ref1]: data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAABYCAYAAACK4D8W\n"
+        "AAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAOxAAADsQBlSsOGwAAACBJREFUOI1jYBgFo2AU\n"
+        "jIJRMApGwSigGNuB0AKMDAxEBASVkOc6h4AAG7YBBWnAQJ5AAAAAElFTkSuQmCC\n"
+        "藏好所有线头。"
+    )
+    cleaned = _clean_deepseek_ocr_output(raw)
+    assert "base64" not in cleaned
+    assert "AAAABHNCSVQ" not in cleaned  # continuation-line fragment
+    assert "组装:" in cleaned
+    assert "藏好所有线头。" in cleaned
+
+
+def test_clean_deepseek_ocr_output_strips_bold_markers():
+    raw = "**组装:**\n如图所示，缝合固定。"
+    cleaned = _clean_deepseek_ocr_output(raw)
+    assert "**" not in cleaned
+    assert "组装:" in cleaned
+
+
+def test_clean_deepseek_ocr_output_leaves_normal_text_untouched():
+    raw = "R1 : 全下针\nR2 : 全下针"
+    assert _clean_deepseek_ocr_output(raw) == raw
 
 
 def test_detect_ocr_language_override_source_and_target_named():

@@ -177,7 +177,7 @@ Here's a complete example workflow:
 ## Tips for Best Results
 
 ### Document Preparation
-- Use text-based PDFs (not scanned images)
+- Scanned/image-based PDFs work too (automatic OCR fallback via `deepseek-ocr:3b`) — native-text PDFs just skip that step and process faster
 - Smaller PDFs process faster
 - Split very large PDFs into sections
 

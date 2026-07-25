@@ -23,9 +23,8 @@ Ollama와 LangChain을 사용해 PDF 문서와 대화하는 완전 로컬 RAG(�
 
 **핵심 모듈 (`src/core/`)**:
 - `document.py`: PDF 텍스트/OCR 로딩과 청크화. `DocumentProcessor.load_pdf()`가 `(documents, used_ocr)`를 반환 — `detect_if_image_based()`(텍스트 길이, CJK 인식 깨짐 비율, 단일문자 단어 비율)로 스캔 문서를 자동 감지하고, 네이티브 추출(`UnstructuredPDFLoader`)이 부실하면 OCR로 폴백
-- `text_extractor.py`: `pytesseract` + `pdf2image` 기반 OCR (300 DPI, 기본 언어 `eng+chi_sim+chi_tra+kor`, `start_page`/`end_page`로 페이지 범위 지정 가능). CJK 문자 사이 불필요한 공백 제거, **반복 워터마크/캡션 줄 제거**(`_strip_recurring_watermark_lines` — 페이지 상단 3줄만 후보로, 퍼지 클러스터링으로 전체 페이지 60% 이상에서 반복되는 줄만 제거)
-- `image_handler.py`: OCR 전처리 — 자동 회전, 노이즈 제거, 그레이스케일, **이미지 수준 워터마크 제거**(`remove_watermark()`, OpenCV Otsu 이진화로 연한 회색 워터마크 제거)
-- `image_analysis.py`: `pytesseract` 래퍼(텍스트 + 텍스트 박스), 이미지 품질 지표(블러/밝기/대비), 언어 감지(`langdetect`)
+- `text_extractor.py`: `pdf2image`로 페이지를 이미지로 변환 후 **`deepseek-ocr:3b`(vision-LLM, Ollama 경유)**로 OCR (2026-07-24, `pytesseract`에서 전환 — 전처리 없이 원본 이미지 그대로 전달; 실측상 pytesseract가 자주 오인식하던 CJK 문자·워터마크·사진 속 캡션까지 정확히 인식). 언어 파라미터 불필요(모델이 알아서 스크립트를 인식). 후처리로 vision-LLM 특유의 마크다운 포맷(헤더 `#`, 굵게 `**`)과 사진이 포함된 페이지에서 가끔 나오는 base64 이미지 데이터(여러 줄로 래핑될 수 있음, `_clean_deepseek_ocr_output()`)를 제거. **반복 워터마크/캡션 줄 제거**(`_strip_recurring_watermark_lines` — 페이지 상단 3줄만 후보로, 퍼지 클러스터링으로 전체 페이지 60% 이상에서 반복되는 줄만 제거)는 엔진과 무관하게 그대로 유지
+- `image_handler.py`, `image_analysis.py`: 이제 실제 OCR 경로에서는 안 쓰임(레거시) — `pytesseract` 기반 텍스트/텍스트박스 추출, 이미지 전처리(회전/노이즈 제거/그레이스케일/워터마크 제거)는 테스트에서만 참조됨. Streamlit 방향 결정 전까지 보류(알려진 문제점 1번 참조)
 - `embeddings.py`: `VectorStore` — OllamaEmbeddings(`nomic-embed-text`) + ChromaDB 저장. API와 Streamlit 양쪽에서 사용
 - ⚠️ `rag.py`(`RAGPipeline`)와 `llm.py`(`LLMManager`)는 **레거시** — 실제 서빙 경로(FastAPI/Streamlit) 어디서도 사용하지 않고 `tests/test_rag.py`만 참조. 실제 RAG 로직은 `src/api/services/rag_service.py`에 인라인으로 구현되어 있음
 
@@ -132,15 +131,14 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 - 번역 응답에는 `_normalize_korean_counts()` 후처리를 항상 적용 — "12개의 코" → "12코" (모델이 지시문을 따르지 않아도 결정적으로 보정)
 
 ### OCR과 워터마크 제거 (스캔 PDF)
-- 업로드: `UnstructuredPDFLoader(strategy="fast")` → `detect_if_image_based()` 판정 → OCR 폴백 (`pdf2image` 300 DPI → 전처리(Otsu 이진화 포함) → `pytesseract --psm 6` → CJK 공백 정리 → 반복 워터마크 줄 제거 → 페이지 단위 Document)
+- 업로드: `UnstructuredPDFLoader(strategy="fast")` → `detect_if_image_based()` 판정 → OCR 폴백 (`pdf2image` 300 DPI, 전처리 없이 원본 이미지 그대로 → `deepseek-ocr:3b`로 페이지별 OCR → 마크다운/base64 아티팩트 제거(`_clean_deepseek_ocr_output`) → CJK 공백 정리 → 반복 워터마크 줄 제거 → 페이지 단위 Document)
 - `PDFService.upload_and_process()`는 `used_ocr=True`면 재청크를 건너뜀 (OCR 경로가 이미 페이지 청크를 반환)
-- 튜닝 지점: `text_extractor.DEFAULT_OCR_LANGUAGE`, `DEFAULT_DPI`, `document.MIN_TEXT_LENGTH` 등 감지 임계값, `text_extractor._WATERMARK_*` 상수
-- 시스템 `tesseract` 바이너리 + 언어팩(`chi_sim`/`chi_tra`/`kor`) 필수 — Python 패키지만으로 부족
+- 튜닝 지점: `text_extractor.DEFAULT_DPI`, `document.MIN_TEXT_LENGTH` 등 감지 임계값, `text_extractor._WATERMARK_*` 상수, `DEEPSEEK_OCR_PROMPT`(OCR 지시 프롬프트)
+- Ollama에 `deepseek-ocr:3b` 모델 pull 필요(`ollama pull deepseek-ocr:3b`) — 시스템 `tesseract` 바이너리는 더 이상 필요 없음(레거시 `image_analysis.py`/`image_handler.py`가 여전히 optional import하지만 실제 경로에서 안 씀)
 
-### 질의 시점 OCR 언어 좁히기 (재-OCR)
-- Tesseract 언어팩에 `eng`이 섞이면 CJK 인식률이 실측으로 하락 (예: `下针` → `FH, Get,` 오인식). 그래서 기본값에서 `eng`을 빼는 대신 **질의별로** 좁힘
-- `_detect_ocr_language_override()`: **번역 의도만 있으면** 트리거 — 소스+타깃 언어를 둘 다 명시하면 그 조합("중국어→한국어" → `chi_sim+chi_tra+kor`), 언어명이 0~1개면 CJK 기본값(`CJK_OCR_LANGUAGE = chi_sim+chi_tra+kor`, `text_extractor.py`)으로 폴백
-- `_reocr_pdf_chunks()`: 원본 파일을 좁힌 언어팩으로 재-OCR (페이지 범위 지정 가능). **결과는 그 질의에만 사용, ChromaDB에는 저장 안 함**. 전체 문서 모드 + `doc_count == page_count`(OCR로 처리된 문서)일 때만
+### 질의 시점 재-OCR
+- 번역 의도가 감지되면 원본 파일을 다시 OCR해서 그 질의에만 사용(`_reocr_pdf_chunks()`, 페이지 범위 지정 가능) — **결과는 ChromaDB에 저장 안 됨**. 전체 문서 모드 + `doc_count == page_count`(OCR로 처리된 문서)일 때만
+- `_detect_ocr_language_override()`/`CJK_OCR_LANGUAGE`는 pytesseract 시절 언어팩 선택 로직의 흔적 — `ocr_language` 파라미터는 시그니처 호환을 위해 계속 받지만 `deepseek-ocr:3b`는 이를 사용하지 않음(스크립트를 자체 인식). 재-OCR 자체는 여전히 유효(오탈자 없는 새 판독을 다시 시도한다는 의미에서)하지만, 언어를 "좁힌다"는 원래 목적은 더 이상 실질적 효과가 없음
 
 ### 우선참조 컨텍스트 (`data/context/`)
 - 모델이 자체 지식보다 **먼저** 참조해야 하는 모든 `*.json` 파일의 범용 저장소 — 용어집(`chi_knitting.json`), 규칙, 도메인 지식 등
@@ -165,7 +163,7 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 - `web-ui/components/elements/response.tsx` — 메시지 마크다운 렌더러. `remark-breaks` 적용됨 (단일 `\n` 줄바꿈 유지 — 백엔드가 보내는 줄 단위 번역/원문에 필수)
 
 **설정**:
-- `requirements.txt` — LangChain 1.0 스택, OCR 의존성(`pytesseract`/`pdf2image`/`opencv-python-headless`/`langdetect`)
+- `requirements.txt` — LangChain 1.0 스택, OCR 의존성(`pdf2image`/`ollama`; `pytesseract`/`opencv-python-headless`는 레거시 경로용으로 남아있음), `langdetect`
 - `run_api.py` — uvicorn 엔트리포인트 (reload=True)
 
 ## 개발 워크플로
@@ -174,28 +172,28 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 2. **RAG 동작 수정**: `rag_service.py`가 유일한 실경로 (core/rag.py 아님). 프롬프트/지시문 상수도 이 파일 상단에 모여 있음
 3. **프론트 DB 스키마 변경**: `pnpm db:generate` → `pnpm db:migrate` (빈 DB에서도 동작), 빠른 반복은 `pnpm db:push`
 4. **우선참조 컨텍스트 추가**: `data/context/`에 JSON 파일 추가/수정 — 재시작 불필요
-5. **OCR/RAG 변경 검증**: 유닛테스트만으로 불충분 — **반드시 실제 백엔드 + 실제 PDF + 실제 Ollama 모델로 end-to-end 확인** (샘플: `pdf_id=pdf_393662820633708541`, `data/pdfs/uploads/pdf_393662820633708541_대바늘_포포토끼.pdf`, 11페이지 — `GET /api/v1/pdfs`로 현재 등록된 pdf_id 재확인 후 사용할 것, 업로드마다 새 ID가 발급되므로 이 값은 바뀔 수 있음). qwen3:14b 생성은 페이지당 수 분 걸리므로 백그라운드로 실행할 것. 테스트 업로드는 검증 후 반드시 삭제 (사용자가 웹 UI를 병행 사용 중)
+5. **OCR/RAG 변경 검증**: 유닛테스트만으로 불충분 — **반드시 실제 백엔드 + 실제 PDF + 실제 Ollama 모델로 end-to-end 확인** (샘플: `pdf_id=pdf_393662820633708541`, `data/pdfs/uploads/pdf_393662820633708541_대바늘_포포토끼.pdf`, 11페이지 — `GET /api/v1/pdfs`로 현재 등록된 pdf_id 재확인 후 사용할 것, 업로드마다 새 ID가 발급되므로 이 값은 바뀔 수 있음). `ollama pull deepseek-ocr:3b`가 먼저 돼 있어야 OCR 경로가 동작함. qwen3:14b 생성은 페이지당 수 분 걸리므로 백그라운드로 실행할 것. 테스트 업로드는 검증 후 반드시 삭제 (사용자가 웹 UI를 병행 사용 중)
 
 ## 알려진 제약
 
 - **포트**: FastAPI 8001, Next.js 3000, Streamlit 8501
 - **ChromaDB**: `data/vectors/` 삭제 시 임베딩 초기화 (재업로드 필요)
 - **동시성**: dev 모드는 `reload=True` — 소스 수정 시 서버 재시작됨 (진행 중 요청 유실 주의). Ollama는 요청을 순차 처리(`-np 1`)
-- **OCR 의존성**: 시스템 `tesseract` + `chi_sim`/`chi_tra`/`kor` 언어팩 필수
+- **OCR 의존성**: Ollama에 `deepseek-ocr:3b` pull 필요 (`ollama pull deepseek-ocr:3b`)
 
 ## 디버깅 팁
 
 - **API 연결**: 백엔드가 `http://localhost:8001`인지, CORS가 요청 origin을 허용하는지 확인
 - **벡터 DB 손상**: `data/vectors/` 삭제 후 PDF 재업로드
 - **프론트 DB 오류**: `pnpm db:migrate`는 빈 `web-ui/data/chat.db`에서도 동작. 대안: `npx tsx web-ui/lib/db/init-db.ts`
-- **중국어 OCR 깨짐**: `ImageHandler.remove_watermark()`가 워터마크를 실제로 제거하는지 전처리 이미지를 덤프해서 먼저 확인
+- **중국어 OCR 깨짐/서식 잔재**: `ollama ps`로 `deepseek-ocr:3b`가 정상 응답하는지 확인. 마크다운(`#`/`**`)이나 base64 이미지 데이터가 저장된 텍스트에 남아있으면 `_clean_deepseek_ocr_output()`(`text_extractor.py`) 후처리 정규식이 그 출력 형태를 못 잡은 것 — 실제 원인이었던 사례: base64 페이로드가 여러 줄로 래핑되면 한 줄만 매칭하는 정규식은 이어지는 줄을 못 지움
 - **ChromaDB 내용 직접 조회**: 조회 명령어는 @.claude/database.md 참조. 여기 저장된 텍스트는 **업로드 시점** OCR 결과임에 주의
 
 ## 알려진 문제점 및 개선 계획
 
 실제 검증(대바늘_포포토끼.pdf, 11페이지)에서 확인된 미해결 이슈. 해결된 항목은 이 목록에서 제거하고 위 아키텍처 섹션에 현재 동작으로 반영함 — 히스토리가 필요하면 git log 참조.
 
-1. 🔶 **저장소 잔재 정리 보류** — (a) `core/rag.py`(`RAGPipeline`), `core/llm.py`(`LLMManager`), `tests/test_rag.py`는 실제 서빙 경로 어디서도 안 쓰임(실 RAG 로직은 `rag_service.py`); Streamlit 앱의 향후 방향(유지/제거)이 결정되기 전까지 삭제 보류. (b) **(2026-07-24 발견)** `data/pdfs/uploads/`에 `api.db`의 `pdfs` 테이블과 매칭되는 레코드가 없는 원본 PDF 파일이 최소 1개 존재(`pdf_1326292550554632241_대바늘_포포토끼.pdf` — 현재 유효한 건 `pdf_393662820633708541_...`뿐) — 이전 세션에서 삭제된 PDF의 원본 파일이 안 지워지고 남은 것으로 보임. `scripts/cleanup_orphans.py`는 현재 ChromaDB 컬렉션만 다루고 `data/pdfs/uploads/` 파일 시스템은 검사하지 않음 — 스크립트 대상에 추가하면 좋을 후보
+1. 🔶 **저장소/레거시 코드 정리 보류** — (a) `core/rag.py`(`RAGPipeline`), `core/llm.py`(`LLMManager`), `tests/test_rag.py`는 실제 서빙 경로 어디서도 안 쓰임(실 RAG 로직은 `rag_service.py`); Streamlit 앱의 향후 방향(유지/제거)이 결정되기 전까지 삭제 보류. (b) **(2026-07-24 발견)** `data/pdfs/uploads/`에 `api.db`의 `pdfs` 테이블과 매칭되는 레코드가 없는 원본 PDF 파일이 최소 1개 존재(`pdf_1326292550554632241_대바늘_포포토끼.pdf` — 현재 유효한 건 `pdf_393662820633708541_...`뿐) — 이전 세션에서 삭제된 PDF의 원본 파일이 안 지워지고 남은 것으로 보임. `scripts/cleanup_orphans.py`는 현재 ChromaDB 컬렉션만 다루고 `data/pdfs/uploads/` 파일 시스템은 검사하지 않음 — 스크립트 대상에 추가하면 좋을 후보. (c) **(2026-07-24 발견)** OCR 엔진을 `deepseek-ocr:3b`로 전환하면서 `image_handler.py`/`image_analysis.py`의 `pytesseract`/OpenCV 전처리 코드도 실제 경로에서 안 쓰이게 됨 — (a)와 같은 이유로 삭제 보류, 테스트에서만 참조됨
 2. ⚠️ **(2026-07-24 발견) 번역 형식 검증이 페이지 단위 평균이라 줄 단위 언어 이탈을 못 잡음** — `_looks_untranslated_output()`은 **페이지 전체**의 한글 비율(15% 기준)만 봄. 페이지 대부분이 정상적으로 한국어로 번역되면, 그 안의 일부 줄(특히 워터마크/캡션처럼 짧고 의미상 독립된 문장, 또는 "Long-tail Cast On 69 sts"처럼 특정 기술 용어 줄)이 영어로 새어도 검증을 통과함 — 실측: 핵심 뜨개 지시문(R1~R41)은 한국어로 정상 번역되면서도 저작권 고지/계정 안내 캡션 줄만 반복적으로 영어로 출력됨. 지시문에 "모든 번역 줄은 한글로" 규칙을 추가해도(위 아키텍처 섹션 참조) 이 특정 패턴은 계속 뚫림 — 프롬프트만으로는 한계가 있어 보이고, 근본 해결은 페이지가 아니라 **줄 단위 언어 검증**으로 바꿔야 할 것으로 보임(아직 미구현 — 범위가 커서 보류 중)
 3. ⚠️ **(2026-07-24 발견/확인) qwen3:14b의 반복 생성(중복) 실패가 페이지마다 비결정적으로 발생** — "全下针"처럼 짧고 실제로 여러 번 반복되는 구조적 지시문 페이지에서, 모델이 이미 생성한 블록을 한 번 더 통째로 반복해버리는 자기회귀 반복 루프 현상이 관찰됨(`_looks_duplicated()`가 감지, 재시도 2회로도 못 고치는 경우 있음). **실행마다 실패하는 페이지가 달라짐**(동일 문서, 동일 코드로 3회 연속 전체 번역 시 실패 페이지가 매번 다름) — 코드 버그가 아니라 모델 자체의 샘플링 확률성(기본 temperature)에 기인하는 것으로 보임
    - ❌ **시도했으나 되돌림**: `repeat_penalty`를 1.1(Ollama 기본)→1.3으로 올려 페이지 루프 호출에 적용해봄 — 해당 실행에서 중복 생성은 0건으로 줄었으나, **더 심각한 새 오류**가 발생함(실측: 정상적으로 반복돼야 할 "코"/"针" 토큰을 모델이 회피하다가 극단적으로 낮은 확률의 토큰을 끌어써서 번역 중간에 **러시아어 단어가 삽입**되고 "[69针织]"처럼 단위 표기가 깨짐). 중복 생성은 이미 `_looks_duplicated()` 재시도 + 실패 시 인라인 경고 표시(위 아키텍처 섹션 참조)로 안전하게(눈에 띄게) 처리되고 있어서, 더 위험한 오류를 감수할 가치가 없다고 판단해 되돌림(`TRANSLATION_REPEAT_PENALTY` 상수/사용 코드 제거, `ChatOllama` 기본값으로 복귀). **다시 시도할 경우 1.3보다 훨씬 보수적인 값(예: 1.15)부터 점진적으로 테스트할 것, 그리고 반드시 전체 문서 라이브 재번역으로 부작용(단위 표기 깨짐·언어 혼입)까지 확인할 것**

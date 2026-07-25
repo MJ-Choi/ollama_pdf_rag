@@ -12,10 +12,9 @@ This fork adds a full OCR and translation pipeline on top of that foundation, bu
 
 ## ✨ Features Added in This Fork
 
-- 🖼️ **Scanned PDF OCR** — Automatic detection of image-based/scanned PDFs, with OCR fallback (`pytesseract` + `pdf2image`) when native text extraction fails or is unreliable
-- 🧹 **Watermark Removal** — Both image-level (OpenCV Otsu binarization) and recurring text-caption removal (a watermark/caption line repeated across most pages is detected via fuzzy clustering and stripped)
+- 🖼️ **Scanned PDF OCR** — Automatic detection of image-based/scanned PDFs, with OCR fallback via a local vision-LLM (`deepseek-ocr:3b` through Ollama) when native text extraction fails or is unreliable — no OCR system dependency (tesseract) to install, and no language pack to configure, since the model reads whatever script is on the page
+- 🧹 **Watermark & Artifact Removal** — Recurring text-caption removal (a watermark/caption line repeated across most pages is detected via fuzzy clustering and stripped) plus cleanup of the vision-LLM's own formatting artifacts (stray markdown headers/bold markers, and occasional embedded base64 image data on photo-heavy pages)
 - 🌐 **Full-Document & Page-Range Translation** — Ask to translate a whole scanned document, or just a page range (e.g. "translate pages 1-2 into Korean"), and get a complete, line-by-line, original-then-translation response:
-  - Query-time OCR language narrowing (drops language packs that hurt CJK recognition accuracy, without weakening the default for other documents)
   - Page-by-page generation loop with automatic retry/continuation, so long documents don't silently cut off partway through
   - Structural validation after generation — catches original/translation block-separation, duplicated content, and target-language drift (e.g. a page coming back in the wrong language) — with bounded automatic retries
   - Deterministic post-processing for natural unit/counter notation in the target language (e.g. removing an unnecessary counter word after a number)
@@ -48,9 +47,9 @@ ollama_pdf_rag/
 │   │   └── main.py           # Streamlit entry point
 │   └── core/                 # Core RAG + OCR functionality
 │       ├── document.py       # PDF processing + scanned-PDF/OCR fallback detection
-│       ├── text_extractor.py # OCR extraction for scanned PDFs (pytesseract + pdf2image)
-│       ├── image_handler.py  # Image preprocessing & watermark removal (OpenCV)
-│       ├── image_analysis.py # OCR wrapper & image quality analysis
+│       ├── text_extractor.py # OCR extraction for scanned PDFs (deepseek-ocr:3b vision-LLM via Ollama + pdf2image)
+│       ├── image_handler.py  # Image preprocessing helpers (legacy/tests; not used by the active OCR path)
+│       ├── image_analysis.py # Image quality analysis + legacy pytesseract wrapper (tests only)
 │       └── embeddings.py     # Vector embeddings
 ├── web-ui/                   # Next.js frontend
 │   ├── app/                  # Next.js app router
@@ -79,13 +78,12 @@ ollama_pdf_rag/
      ```bash
      ollama pull qwen3:14b  # or your preferred chat model
      ollama pull nomic-embed-text  # for embeddings
+     ollama pull deepseek-ocr:3b  # for scanned/image-based PDF OCR
      ```
 
-2. **Install OCR system dependencies** (needed for scanned/image-based PDFs)
-   - [`tesseract`](https://github.com/tesseract-ocr/tesseract) with the language packs you need (e.g. `chi_sim`, `chi_tra`, `kor`, `eng`)
-   - macOS: `brew install tesseract tesseract-lang`
-   - Ubuntu/Debian: `sudo apt-get install tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-chi-tra tesseract-ocr-kor`
-   - `poppler` (required by `pdf2image`) — macOS: `brew install poppler`, Ubuntu/Debian: `sudo apt-get install poppler-utils`
+2. **Install `poppler`** (required by `pdf2image` to rasterize PDF pages for OCR)
+   - macOS: `brew install poppler`
+   - Ubuntu/Debian: `sudo apt-get install poppler-utils`
 
 3. **Clone this repository**
    ```bash
@@ -215,7 +213,7 @@ python scripts/cleanup_orphans.py --apply
 - **Model not found**: Pull models with `ollama pull <model-name>`
 - **No chunks retrieved**: Re-upload PDFs to rebuild the vector database
 - **Port conflicts**: Check if ports 3000, 8001, or 8501 are in use
-- **Garbled/wrong OCR text on a scanned PDF**: Confirm the `tesseract` language packs you need are installed, and try the re-OCR (refresh) button on that PDF after fixing the OCR setup
+- **Garbled/wrong OCR text on a scanned PDF**: Confirm `ollama pull deepseek-ocr:3b` completed successfully, then try the re-OCR (refresh) button on that PDF
 
 ### Common Errors
 
