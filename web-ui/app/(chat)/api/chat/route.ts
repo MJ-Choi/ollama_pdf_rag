@@ -1,6 +1,11 @@
 import { ollamaChat } from "@/lib/ai/provider";
 import { getDefaultChatModel } from "@/lib/ai/models";
 import { createUIMessageStream, createUIMessageStreamResponse } from "ai";
+import { after } from "next/server";
+import {
+  type ResumableStreamContext,
+  createResumableStreamContext,
+} from "resumable-stream";
 import { auth } from "@/app/(auth)/auth";
 import {
   deleteChatById,
@@ -17,12 +22,40 @@ import { generateUUID } from "@/lib/utils";
 // function mid-translation. Actual ceiling depends on the Vercel plan tier.
 export const maxDuration = 1800;
 
+// Backs "resume an in-progress response after a page refresh" (see
+// [id]/stream/route.ts), via Redis (REDIS_URL). This app doesn't set up a
+// real Redis instance for local dev (.env.local's REDIS_URL is an unset
+// placeholder) — any failure to construct the context is treated as
+// "feature unavailable" and falls back to null rather than throwing, same
+// as the upstream template's intent when Redis isn't configured.
+let globalStreamContext: ResumableStreamContext | null = null;
+let loggedStreamContextUnavailable = false;
+
+export function getStreamContext() {
+  if (!globalStreamContext) {
+    try {
+      globalStreamContext = createResumableStreamContext({
+        waitUntil: after,
+      });
+    } catch {
+      if (!loggedStreamContextUnavailable) {
+        console.log(
+          " > Resumable streams are disabled (no working REDIS_URL)"
+        );
+        loggedStreamContextUnavailable = true;
+      }
+    }
+  }
+  return globalStreamContext;
+}
+
 interface MessagePart {
   type: string;
   text?: string;
   url?: string;
   name?: string;
   mediaType?: string;
+  data?: unknown;
 }
 
 interface PostRequestBody {
@@ -78,7 +111,6 @@ export async function POST(request: Request) {
     const body: PostRequestBody = await request.json();
     const chatId = body.id;
 
-    // Get user session
     const session = await auth();
     if (!session?.user?.id) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -88,13 +120,11 @@ export async function POST(request: Request) {
     }
     const userId = session.user.id;
 
-    // Use selected model or fetch default from available Ollama models
-    const selectedChatModel = body.selectedChatModel || await getDefaultChatModel();
+    const selectedChatModel =
+      body.selectedChatModel || (await getDefaultChatModel());
     console.log("Using model:", selectedChatModel);
-
     console.log("Received message:", JSON.stringify(body.message, null, 2));
 
-    // Extract text content from message parts
     const textPart = body.message.parts.find((p) => p.type === "text");
     const textContent = textPart?.text || "";
 
@@ -108,31 +138,26 @@ export async function POST(request: Request) {
       );
     }
 
-    // Check if chat exists, create if not
-    let chat = await getChatById({ id: chatId });
-    const isNewChat = !chat;
+    const chat = await getChatById({ id: chatId });
 
     if (!chat) {
-      // Create new chat with first message as title (truncated)
-      const title = textContent.slice(0, 100) + (textContent.length > 100 ? "..." : "");
+      const title =
+        textContent.slice(0, 100) + (textContent.length > 100 ? "..." : "");
       await saveChat({
         id: chatId,
         userId,
         title,
-        visibility: (body.selectedVisibilityType as "private" | "public") || "private",
+        visibility:
+          (body.selectedVisibilityType as "private" | "public") || "private",
       });
       console.log("Created new chat:", chatId);
     }
 
-    // Use PDF IDs from frontend (user's selection)
     const selectedPdfIds = body.selectedPdfIds || [];
     console.log("Selected PDF IDs from frontend:", selectedPdfIds);
-
-    // Check if question needs document context
     const questionNeedsContext = needsDocumentContext(textContent);
     console.log("Question needs document context:", questionNeedsContext);
 
-    // Save user message
     const userMessageId = body.message.id || generateUUID();
     await saveMessages({
       messages: [{
@@ -146,14 +171,15 @@ export async function POST(request: Request) {
     });
     console.log("Saved user message:", userMessageId);
 
-    // Determine if we should use RAG or general chat
     const useRAG = selectedPdfIds.length > 0;
-    const noPdfsButNeedsContext = selectedPdfIds.length === 0 && questionNeedsContext;
-
+    const noPdfsButNeedsContext =
+      selectedPdfIds.length === 0 && questionNeedsContext;
     console.log("Mode:", useRAG ? "RAG" : "General Chat");
     console.log("No PDFs but needs context:", noPdfsButNeedsContext);
 
-    // Build message history (for now, just the current message)
+    // Only the current message is sent — there's no conversation history in
+    // this call. RAGService.query_multi_pdf() is itself stateless/single-turn
+    // (see root CLAUDE.md), so passing prior turns here wouldn't do anything yet.
     const messages = [{ role: body.message.role, content: textContent }];
 
     let result;
@@ -161,8 +187,6 @@ export async function POST(request: Request) {
     let reasoningSteps: string[] = [];
 
     if (noPdfsButNeedsContext) {
-      // Warn user that no PDFs are selected
-      console.log("Warning: Question seems to need document context but no PDFs selected");
       formattedResponse = `⚠️ **No documents selected**
 
 It looks like your question might be about a document, but you haven't selected any PDFs to search.
@@ -177,32 +201,27 @@ It looks like your question might be about a document, but you haven't selected 
 ---
 
 *Your question was: "${textContent}"*`;
-      
+      console.log("Warning: Question seems to need document context but no PDFs selected");
+
       result = {
         answer: formattedResponse,
         sources: [],
         metadata: { reasoning_steps: ["⚠️ No PDFs selected for document query"] }
       };
     } else if (useRAG) {
-      // Use RAG with selected PDFs
-      const reqDtm = new Date().toISOString().slice(0, 19).replace("T", " ");
       console.log("Sending to backend:", {
-        reqDtm,
         question: textContent,
         model: selectedChatModel,
         pdfIds: selectedPdfIds,
       });
-
       console.log("Calling ollamaChat with RAG...");
       result = await ollamaChat(messages, selectedChatModel, selectedPdfIds);
-      
-      // Format response with sources
-      formattedResponse = `${result.answer}\n\n**Sources:**\n${result.sources
-        .map((s: any) => `- ${s.pdf_name} (chunk ${s.chunk_index})`)
-        .join("\n")}`;
+      // Sources are rendered separately by SourcesPanel (clickable, opens
+      // the PDF viewer) via the data-sources part below — not appended as
+      // flat text here, so the answer text doesn't duplicate them.
+      formattedResponse = result.answer;
       reasoningSteps = result.metadata.reasoning_steps || [];
     } else {
-      // General chat without RAG
       console.log("Calling ollamaChat for general chat (no RAG)...");
       result = await ollamaChat(messages, selectedChatModel, undefined);
       formattedResponse = result.answer;
@@ -214,23 +233,28 @@ It looks like your question might be about a document, but you haven't selected 
       hasReasoningSteps: !!result.metadata?.reasoning_steps,
       reasoningStepsCount: result.metadata?.reasoning_steps?.length || 0,
     });
-
     console.log("Reasoning steps:", reasoningSteps);
     console.log("Formatted response length:", formattedResponse.length);
     console.log("First 200 chars of response:", formattedResponse.substring(0, 200));
 
-    // Save assistant message
     const assistantMessageId = generateUUID();
-    const assistantParts = [
-      { type: "text", text: formattedResponse },
-    ];
+    const assistantParts: MessagePart[] = [{ type: "text", text: formattedResponse }];
 
-    // Add reasoning parts if present
+    // Persisted alongside the text so SourcesPanel (clickable citations
+    // that open the PDF viewer) still renders after a reload — the live
+    // stream's data-sources part is transient and isn't saved on its own.
+    if (result.sources && result.sources.length > 0) {
+      assistantParts.unshift({
+        type: "data-sources",
+        data: result.sources,
+      });
+    }
+
     if (reasoningSteps.length > 0) {
       assistantParts.unshift({
         type: "reasoning",
         text: reasoningSteps.join("\n"),
-      } as any);
+      });
     }
 
     await saveMessages({
@@ -245,7 +269,6 @@ It looks like your question might be about a document, but you haven't selected 
     });
     console.log("Saved assistant message:", assistantMessageId);
 
-    // Create a UI message stream using AI SDK
     console.log("Creating UI message stream...");
     const textId = "text-1";
 
@@ -256,7 +279,9 @@ It looks like your question might be about a document, but you haven't selected 
           messageMetadata: { createdAt: new Date().toISOString() },
         });
 
-        // Write reasoning steps progressively with delay for streaming effect
+        // Streamed progressively (with small delays below) purely for a
+        // streaming visual effect — the full text is already known at this
+        // point, unlike a real token-by-token model stream.
         if (reasoningSteps && reasoningSteps.length > 0) {
           console.log("Writing reasoning steps progressively:", reasoningSteps.length);
           const reasoningId = "reasoning-1";
@@ -269,24 +294,21 @@ It looks like your question might be about a document, but you haven't selected 
               id: reasoningId,
               delta: step + "\n",
             });
-            // Small delay between reasoning steps for progressive display
             await new Promise(resolve => setTimeout(resolve, 150));
           }
 
           writer.write({ type: "reasoning-end", id: reasoningId });
         }
 
-        // Write sources as custom data (only for RAG mode)
         const sources = result.sources || [];
         if (sources.length > 0) {
           console.log("Writing sources:", sources.length);
           writer.write({
-            type: "data-sources" as any,
+            type: "data-sources",
             data: sources,
           });
         }
 
-        // Write text content progressively with text chunks
         console.log("Writing text content progressively...");
         writer.write({ type: "text-start", id: textId });
 
@@ -297,7 +319,6 @@ It looks like your question might be about a document, but you haven't selected 
             id: textId,
             delta: words[i] + " ",
           });
-          // Delay every few words for smoother streaming
           if (i % 3 === 0) {
             await new Promise(resolve => setTimeout(resolve, 30));
           }

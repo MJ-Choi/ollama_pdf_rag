@@ -41,38 +41,16 @@ Navigate to [http://localhost:3000](http://localhost:3000)
 4. Get Answer     →  Response with source citations
 ```
 
-## Option 2: Streamlit UI (Classic)
-
-The Streamlit interface is simpler and good for quick testing.
-
-### Start the App
-
-```bash
-python run.py
-```
-
-### Open the App
-
-Navigate to [http://localhost:8501](http://localhost:8501)
-
-![Streamlit Interface](../assets/st_app_ui.png)
-
 ## Basic Usage
 
 ### 1. Upload a PDF
 
-**Next.js:**
 - Click the 📎 (paperclip) button in the chat input
 - Select your PDF file
 - Wait for processing (shown in toast notification)
 
-**Streamlit:**
-- Use the file uploader in the sidebar
-- Or click "Load Sample PDF"
-
 ### 2. Select PDFs for Context
 
-**Next.js:**
 ```
 ☐ Warranty_Book.pdf (11 chunks • 1 pages)
 ☑️ Security_Guide.pdf (45 chunks • 12 pages)
@@ -140,7 +118,6 @@ The document covers three main security aspects:
 | Service | URL | Purpose |
 |---------|-----|---------|
 | Next.js UI | http://localhost:3000 | Modern chat interface |
-| Streamlit UI | http://localhost:8501 | Classic interface |
 | FastAPI Backend | http://localhost:8001 | REST API |
 | API Docs | http://localhost:8001/docs | Swagger UI |
 | Health Check | http://localhost:8001/health | Status endpoint |

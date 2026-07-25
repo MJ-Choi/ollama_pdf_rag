@@ -151,7 +151,6 @@ ollama_pdf_rag/
 │   └── api.db            # SQLite metadata
 ├── src/
 │   ├── api/              # FastAPI backend
-│   ├── app/              # Streamlit app
 │   └── core/             # Core RAG logic
 ├── web-ui/               # Next.js frontend
 │   ├── app/              # Next.js app router

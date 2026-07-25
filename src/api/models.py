@@ -37,6 +37,7 @@ class SourceInfo(BaseModel):
     pdf_name: str
     pdf_id: str
     chunk_index: int
+    source_page: Optional[int] = None
 
 
 class QueryResponse(BaseModel):

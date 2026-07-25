@@ -20,9 +20,10 @@ import {
   SidebarMenuItem,
   SidebarMenuButton,
 } from "@/components/ui/sidebar";
-import { FileText, Trash2, Square, CheckSquare, RefreshCw } from "lucide-react";
+import { FileText, Trash2, Square, CheckSquare, RefreshCw, Eye } from "lucide-react";
 import { fetcher } from "@/lib/utils";
 import { usePDFSelection } from "@/hooks/use-pdf-selection";
+import { usePdfViewer } from "@/hooks/use-pdf-viewer";
 import { Button } from "./ui/button";
 
 interface PDF {
@@ -46,6 +47,7 @@ export function SidebarPDFs() {
 
   // Use global PDF selection state (persists across chats)
   const { selectedPdfIds, togglePdf, selectAll, clearSelection, isSelected } = usePDFSelection();
+  const { openPdf } = usePdfViewer();
 
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
@@ -227,6 +229,24 @@ export function SidebarPDFs() {
                         </div>
                       </div>
                     </SidebarMenuButton>
+                    <div
+                      className="ml-2 cursor-pointer opacity-0 transition-opacity group-hover/pdf:opacity-100"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openPdf(pdf.pdf_id, pdf.name, 1);
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      title="View PDF pages"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          openPdf(pdf.pdf_id, pdf.name, 1);
+                        }
+                      }}
+                    >
+                      <Eye className="h-4 w-4 text-zinc-500 hover:text-primary" />
+                    </div>
                     <div
                       className="ml-2 cursor-pointer opacity-0 transition-opacity group-hover/pdf:opacity-100"
                       onClick={(e) => {

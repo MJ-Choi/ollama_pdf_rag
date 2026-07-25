@@ -12,8 +12,7 @@
 
 Ollama와 LangChain을 사용해 PDF 문서와 대화하는 완전 로컬 RAG(검색 증강 생성) 애플리케이션.
 - **Python 백엔드**: FastAPI REST API — RAG 파이프라인, PDF/OCR 처리, ChromaDB 벡터 저장
-- **Next.js 프론트엔드**: 채팅 영속화, PDF 관리, 모델 선택 UI
-- **Streamlit 앱**: 실험용 보조 UI (레거시, 독립 동작)
+- **Next.js 프론트엔드**: 채팅 영속화, PDF 관리, PDF 페이지 뷰어, 모델 선택 UI
 
 주 사용 사례: 스캔된 중국어 뜨개질 도안 PDF를 OCR로 읽어 한국어로 번역/질의.
 
@@ -24,9 +23,9 @@ Ollama와 LangChain을 사용해 PDF 문서와 대화하는 완전 로컬 RAG(�
 **핵심 모듈 (`src/core/`)**:
 - `document.py`: PDF 텍스트/OCR 로딩과 청크화. `DocumentProcessor.load_pdf()`가 `(documents, used_ocr)`를 반환 — `detect_if_image_based()`(텍스트 길이, CJK 인식 깨짐 비율, 단일문자 단어 비율)로 스캔 문서를 자동 감지하고, 네이티브 추출(`UnstructuredPDFLoader`)이 부실하면 OCR로 폴백
 - `text_extractor.py`: `pdf2image`로 페이지를 이미지로 변환 후 **`deepseek-ocr:3b`(vision-LLM, Ollama 경유)**로 OCR (2026-07-24, `pytesseract`에서 전환 — 전처리 없이 원본 이미지 그대로 전달; 실측상 pytesseract가 자주 오인식하던 CJK 문자·워터마크·사진 속 캡션까지 정확히 인식). 언어 파라미터 불필요(모델이 알아서 스크립트를 인식). 후처리로 vision-LLM 특유의 마크다운 포맷(헤더 `#`, 굵게 `**`)과 사진이 포함된 페이지에서 가끔 나오는 base64 이미지 데이터(여러 줄로 래핑될 수 있음, `_clean_deepseek_ocr_output()`)를 제거. **반복 워터마크/캡션 줄 제거**(`_strip_recurring_watermark_lines` — 페이지 상단 3줄만 후보로, 퍼지 클러스터링으로 전체 페이지 60% 이상에서 반복되는 줄만 제거)는 엔진과 무관하게 그대로 유지
-- `image_handler.py`, `image_analysis.py`: 이제 실제 OCR 경로에서는 안 쓰임(레거시) — `pytesseract` 기반 텍스트/텍스트박스 추출, 이미지 전처리(회전/노이즈 제거/그레이스케일/워터마크 제거)는 테스트에서만 참조됨. Streamlit 방향 결정 전까지 보류(알려진 문제점 1번 참조)
-- `embeddings.py`: `VectorStore` — OllamaEmbeddings(`nomic-embed-text`) + ChromaDB 저장. API와 Streamlit 양쪽에서 사용
-- ⚠️ `rag.py`(`RAGPipeline`)와 `llm.py`(`LLMManager`)는 **레거시** — 실제 서빙 경로(FastAPI/Streamlit) 어디서도 사용하지 않고 `tests/test_rag.py`만 참조. 실제 RAG 로직은 `src/api/services/rag_service.py`에 인라인으로 구현되어 있음
+- `image_analysis.py`: `ImageAnalyzer` — `analyze_image_quality()`(블러/밝기/대비), `detect_language()`는 여전히 실제 경로에서 사용됨. `extract_text_with_ocr()`/`extract_text_boxes()`(pytesseract 기반)는 이제 안 쓰임(레거시, 테스트에서만 참조)
+- `image_handler.py`: `ImageHandler`(회전/노이즈 제거/그레이스케일/워터마크 제거 전처리) — 실제 OCR 경로에서는 안 쓰임(레거시, 테스트에서만 참조). `text_extractor.py`가 인스턴스는 만들지만 실제로 호출하지는 않음
+- `embeddings.py`: `VectorStore` — OllamaEmbeddings(`nomic-embed-text`) + ChromaDB 저장
 
 **API 계층 (`src/api/`)**:
 - `main.py`: FastAPI 앱 설정. CORS는 `http://localhost:3000`(Next.js)만 허용. `pdfs`, `query`, `models`, `health` 라우터 등록
@@ -65,7 +64,7 @@ python run_api.py
 python -m pytest tests/ -v
 python -m pytest tests/ --cov=src
 python -m pytest tests/test_ocr_pipeline.py -v          # 단일 파일
-python -m pytest tests/test_rag.py::test_specific_case  # 단일 테스트
+python -m pytest tests/test_ocr_pipeline.py::test_specific_case  # 단일 테스트
 
 # pre-commit (pytest + pylint 실행 — 2026-07-23부터 CI와 동일하게 pytest 사용)
 pre-commit install
@@ -98,11 +97,10 @@ TS/TSX 코드는 `web-ui/.cursor/rules/ultracite.mdc`(Ultracite/Biome 규칙)의
 ### 전체 실행
 
 ```bash
-./start_all.sh   # FastAPI(8001) + Next.js(3000) + Streamlit(8501) 동시 기동
+./start_all.sh   # FastAPI(8001) + Next.js(3000) 동시 기동
 # 또는 개별 실행:
 python run_api.py            # 터미널 1
 cd web-ui && pnpm dev        # 터미널 2
-python run.py                # (선택) Streamlit
 ```
 
 ## 아키텍처 결정 및 핵심 패턴
@@ -169,14 +167,14 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 ## 개발 워크플로
 
 1. **API 엔드포인트 추가**: `src/api/routers/`에 라우터 생성 → `main.py`에 등록 → 필요 시 CORS 갱신 → `http://localhost:8001/docs`에서 확인
-2. **RAG 동작 수정**: `rag_service.py`가 유일한 실경로 (core/rag.py 아님). 프롬프트/지시문 상수도 이 파일 상단에 모여 있음
+2. **RAG 동작 수정**: `rag_service.py`가 유일한 실경로. 프롬프트/지시문 상수도 이 파일 상단에 모여 있음
 3. **프론트 DB 스키마 변경**: `pnpm db:generate` → `pnpm db:migrate` (빈 DB에서도 동작), 빠른 반복은 `pnpm db:push`
 4. **우선참조 컨텍스트 추가**: `data/context/`에 JSON 파일 추가/수정 — 재시작 불필요
 5. **OCR/RAG 변경 검증**: 유닛테스트만으로 불충분 — **반드시 실제 백엔드 + 실제 PDF + 실제 Ollama 모델로 end-to-end 확인** (샘플: `pdf_id=pdf_393662820633708541`, `data/pdfs/uploads/pdf_393662820633708541_대바늘_포포토끼.pdf`, 11페이지 — `GET /api/v1/pdfs`로 현재 등록된 pdf_id 재확인 후 사용할 것, 업로드마다 새 ID가 발급되므로 이 값은 바뀔 수 있음). `ollama pull deepseek-ocr:3b`가 먼저 돼 있어야 OCR 경로가 동작함. qwen3:14b 생성은 페이지당 수 분 걸리므로 백그라운드로 실행할 것. 테스트 업로드는 검증 후 반드시 삭제 (사용자가 웹 UI를 병행 사용 중)
 
 ## 알려진 제약
 
-- **포트**: FastAPI 8001, Next.js 3000, Streamlit 8501
+- **포트**: FastAPI 8001, Next.js 3000
 - **ChromaDB**: `data/vectors/` 삭제 시 임베딩 초기화 (재업로드 필요)
 - **동시성**: dev 모드는 `reload=True` — 소스 수정 시 서버 재시작됨 (진행 중 요청 유실 주의). Ollama는 요청을 순차 처리(`-np 1`)
 - **OCR 의존성**: Ollama에 `deepseek-ocr:3b` pull 필요 (`ollama pull deepseek-ocr:3b`)
@@ -193,7 +191,8 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 
 실제 검증(대바늘_포포토끼.pdf, 11페이지)에서 확인된 미해결 이슈. 해결된 항목은 이 목록에서 제거하고 위 아키텍처 섹션에 현재 동작으로 반영함 — 히스토리가 필요하면 git log 참조.
 
-1. 🔶 **저장소/레거시 코드 정리 보류** — (a) `core/rag.py`(`RAGPipeline`), `core/llm.py`(`LLMManager`), `tests/test_rag.py`는 실제 서빙 경로 어디서도 안 쓰임(실 RAG 로직은 `rag_service.py`); Streamlit 앱의 향후 방향(유지/제거)이 결정되기 전까지 삭제 보류. (b) **(2026-07-24 발견)** `data/pdfs/uploads/`에 `api.db`의 `pdfs` 테이블과 매칭되는 레코드가 없는 원본 PDF 파일이 최소 1개 존재(`pdf_1326292550554632241_대바늘_포포토끼.pdf` — 현재 유효한 건 `pdf_393662820633708541_...`뿐) — 이전 세션에서 삭제된 PDF의 원본 파일이 안 지워지고 남은 것으로 보임. `scripts/cleanup_orphans.py`는 현재 ChromaDB 컬렉션만 다루고 `data/pdfs/uploads/` 파일 시스템은 검사하지 않음 — 스크립트 대상에 추가하면 좋을 후보. (c) **(2026-07-24 발견)** OCR 엔진을 `deepseek-ocr:3b`로 전환하면서 `image_handler.py`/`image_analysis.py`의 `pytesseract`/OpenCV 전처리 코드도 실제 경로에서 안 쓰이게 됨 — (a)와 같은 이유로 삭제 보류, 테스트에서만 참조됨
-2. ⚠️ **(2026-07-24 발견) 번역 형식 검증이 페이지 단위 평균이라 줄 단위 언어 이탈을 못 잡음** — `_looks_untranslated_output()`은 **페이지 전체**의 한글 비율(15% 기준)만 봄. 페이지 대부분이 정상적으로 한국어로 번역되면, 그 안의 일부 줄(특히 워터마크/캡션처럼 짧고 의미상 독립된 문장, 또는 "Long-tail Cast On 69 sts"처럼 특정 기술 용어 줄)이 영어로 새어도 검증을 통과함 — 실측: 핵심 뜨개 지시문(R1~R41)은 한국어로 정상 번역되면서도 저작권 고지/계정 안내 캡션 줄만 반복적으로 영어로 출력됨. 지시문에 "모든 번역 줄은 한글로" 규칙을 추가해도(위 아키텍처 섹션 참조) 이 특정 패턴은 계속 뚫림 — 프롬프트만으로는 한계가 있어 보이고, 근본 해결은 페이지가 아니라 **줄 단위 언어 검증**으로 바꿔야 할 것으로 보임(아직 미구현 — 범위가 커서 보류 중)
-3. ⚠️ **(2026-07-24 발견/확인) qwen3:14b의 반복 생성(중복) 실패가 페이지마다 비결정적으로 발생** — "全下针"처럼 짧고 실제로 여러 번 반복되는 구조적 지시문 페이지에서, 모델이 이미 생성한 블록을 한 번 더 통째로 반복해버리는 자기회귀 반복 루프 현상이 관찰됨(`_looks_duplicated()`가 감지, 재시도 2회로도 못 고치는 경우 있음). **실행마다 실패하는 페이지가 달라짐**(동일 문서, 동일 코드로 3회 연속 전체 번역 시 실패 페이지가 매번 다름) — 코드 버그가 아니라 모델 자체의 샘플링 확률성(기본 temperature)에 기인하는 것으로 보임
+1. ✅ **(해결됨, 2026-07-25) Streamlit 앱 및 관련 레거시 코드 제거** — Streamlit 방향(유지/제거) 결정: 제거로 확정. `src/app/`(Streamlit 앱 전체), `run.py`, `core/rag.py`(`RAGPipeline`), `core/llm.py`(`LLMManager`), `tests/test_rag.py`, `tests/test_models.py`(Streamlit 전용 유틸 테스트), `st_app_ui.png` 삭제. `start_all.sh`/`requirements.txt`(`streamlit`, `pdfplumber`, `pdfminer.six`)/README.md/`.claude/CLAUDE.md`에서 관련 참조 제거. `image_handler.py`/`image_analysis.py`의 pytesseract 레거시 코드는 별개 사안(OCR 엔진 전환 관련, Streamlit과 무관)이라 이번엔 그대로 둠 — 필요하면 별도로 논의
+2. 🔶 **(2026-07-24 발견)** `data/pdfs/uploads/`에 `api.db`의 `pdfs` 테이블과 매칭되는 레코드가 없는 원본 PDF 파일이 최소 1개 존재(`pdf_1326292550554632241_대바늘_포포토끼.pdf` — 현재 유효한 건 `pdf_393662820633708541_...`뿐) — 이전 세션에서 삭제된 PDF의 원본 파일이 안 지워지고 남은 것으로 보임. `scripts/cleanup_orphans.py`는 현재 ChromaDB 컬렉션만 다루고 `data/pdfs/uploads/` 파일 시스템은 검사하지 않음 — 스크립트 대상에 추가하면 좋을 후보
+3. ⚠️ **(2026-07-24 발견) 번역 형식 검증이 페이지 단위 평균이라 줄 단위 언어 이탈을 못 잡음** — `_looks_untranslated_output()`은 **페이지 전체**의 한글 비율(15% 기준)만 봄. 페이지 대부분이 정상적으로 한국어로 번역되면, 그 안의 일부 줄(특히 워터마크/캡션처럼 짧고 의미상 독립된 문장, 또는 "Long-tail Cast On 69 sts"처럼 특정 기술 용어 줄)이 영어로 새어도 검증을 통과함 — 실측: 핵심 뜨개 지시문(R1~R41)은 한국어로 정상 번역되면서도 저작권 고지/계정 안내 캡션 줄만 반복적으로 영어로 출력됨. 지시문에 "모든 번역 줄은 한글로" 규칙을 추가해도(위 아키텍처 섹션 참조) 이 특정 패턴은 계속 뚫림 — 프롬프트만으로는 한계가 있어 보이고, 근본 해결은 페이지가 아니라 **줄 단위 언어 검증**으로 바꿔야 할 것으로 보임(아직 미구현 — 범위가 커서 보류 중)
+4. ⚠️ **(2026-07-24 발견/확인) qwen3:14b의 반복 생성(중복) 실패가 페이지마다 비결정적으로 발생** — "全下针"처럼 짧고 실제로 여러 번 반복되는 구조적 지시문 페이지에서, 모델이 이미 생성한 블록을 한 번 더 통째로 반복해버리는 자기회귀 반복 루프 현상이 관찰됨(`_looks_duplicated()`가 감지, 재시도 2회로도 못 고치는 경우 있음). **실행마다 실패하는 페이지가 달라짐**(동일 문서, 동일 코드로 3회 연속 전체 번역 시 실패 페이지가 매번 다름) — 코드 버그가 아니라 모델 자체의 샘플링 확률성(기본 temperature)에 기인하는 것으로 보임
    - ❌ **시도했으나 되돌림**: `repeat_penalty`를 1.1(Ollama 기본)→1.3으로 올려 페이지 루프 호출에 적용해봄 — 해당 실행에서 중복 생성은 0건으로 줄었으나, **더 심각한 새 오류**가 발생함(실측: 정상적으로 반복돼야 할 "코"/"针" 토큰을 모델이 회피하다가 극단적으로 낮은 확률의 토큰을 끌어써서 번역 중간에 **러시아어 단어가 삽입**되고 "[69针织]"처럼 단위 표기가 깨짐). 중복 생성은 이미 `_looks_duplicated()` 재시도 + 실패 시 인라인 경고 표시(위 아키텍처 섹션 참조)로 안전하게(눈에 띄게) 처리되고 있어서, 더 위험한 오류를 감수할 가치가 없다고 판단해 되돌림(`TRANSLATION_REPEAT_PENALTY` 상수/사용 코드 제거, `ChatOllama` 기본값으로 복귀). **다시 시도할 경우 1.3보다 훨씬 보수적인 값(예: 1.15)부터 점진적으로 테스트할 것, 그리고 반드시 전체 문서 라이브 재번역으로 부작용(단위 표기 깨짐·언어 혼입)까지 확인할 것**

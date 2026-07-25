@@ -1,12 +1,13 @@
 "use client";
 
-import { Card } from "@/components/ui/card";
 import { FileText } from "lucide-react";
+import { usePdfViewer } from "@/hooks/use-pdf-viewer";
 
 interface Source {
   pdf_name: string;
   pdf_id: string;
   chunk_index: number;
+  source_page?: number | null;
 }
 
 interface SourcesPanelProps {
@@ -14,33 +15,40 @@ interface SourcesPanelProps {
 }
 
 export function SourcesPanel({ sources }: SourcesPanelProps) {
+  const { openPdf } = usePdfViewer();
+
   if (!sources || sources.length === 0) return null;
 
-  // Group by PDF
-  const grouped = sources.reduce(
-    (acc, source) => {
-      if (!acc[source.pdf_name]) {
-        acc[source.pdf_name] = 0;
-      }
-      acc[source.pdf_name]++;
-      return acc;
-    },
-    {} as Record<string, number>
-  );
+  // One citation per (pdf, page) — a page cited by multiple chunks only
+  // needs one clickable entry, and chunks with no page info (native-text
+  // PDFs) collapse into a single "view PDF" entry per document.
+  const seen = new Set<string>();
+  const citations = sources.filter((source) => {
+    const key = `${source.pdf_id}:${source.source_page ?? "doc"}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 
   return (
-    <Card className="mt-4 p-4">
-      <div className="flex items-center gap-2 mb-3">
-        <FileText className="h-4 w-4" />
-        <span className="text-sm font-medium">Sources</span>
+    <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
+      <div className="flex items-center gap-1 text-muted-foreground">
+        <FileText className="h-3.5 w-3.5" />
+        <span>Sources:</span>
       </div>
-      <ul className="text-sm space-y-1">
-        {Object.entries(grouped).map(([name, count]) => (
-          <li key={name} className="text-muted-foreground">
-            • <strong>{name}</strong> ({count} chunks)
-          </li>
-        ))}
-      </ul>
-    </Card>
+      {citations.map((source) => (
+        <button
+          className="rounded-full border px-2 py-0.5 text-xs transition-colors hover:bg-muted"
+          key={`${source.pdf_id}-${source.source_page ?? source.chunk_index}`}
+          onClick={() =>
+            openPdf(source.pdf_id, source.pdf_name, source.source_page ?? 1)
+          }
+          type="button"
+        >
+          {source.pdf_name}
+          {source.source_page ? ` p.${source.source_page}` : ""}
+        </button>
+      ))}
+    </div>
   );
 }

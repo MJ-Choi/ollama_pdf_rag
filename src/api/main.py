@@ -19,7 +19,6 @@ logging.basicConfig(
 
 from .routers import pdfs, query, models, health
 from .database import engine, Base
-from .config import settings
 
 # Create database tables
 Base.metadata.create_all(bind=engine)

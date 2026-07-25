@@ -123,8 +123,9 @@ which is split by character count via `split_documents()`.
 `pytesseract`-based extraction (`ImageAnalyzer.extract_text_with_ocr()` /
 `extract_text_boxes()` in `image_analysis.py`, plus `ImageHandler`'s
 preprocessing in `image_handler.py`) still exists in the codebase but is no
-longer called by this pipeline — it's exercised only by tests, kept pending
-a decision on the legacy Streamlit app's direction.
+longer called by this pipeline — it's exercised only by tests. The legacy
+Streamlit app that used to be the other reason to keep this code around has
+since been removed entirely.
 
 ## Usage Example
 

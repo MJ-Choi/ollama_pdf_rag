@@ -23,13 +23,6 @@ echo "   Next.js PID: $NEXTJS_PID"
 cd ..
 echo ""
 
-# Start Streamlit admin (optional)
-echo "🔧 Starting Streamlit admin (port 8501)..."
-python3 run.py &
-STREAMLIT_PID=$!
-echo "   Streamlit PID: $STREAMLIT_PID"
-echo ""
-
 echo "=================================="
 echo "All services started!"
 echo "=================================="
@@ -37,7 +30,6 @@ echo ""
 echo "📡 Service URLs:"
 echo "   • FastAPI Backend:  http://localhost:8001"
 echo "   • Next.js Frontend: http://localhost:3000"
-echo "   • Streamlit Admin:  http://localhost:8501"
 echo ""
 echo "📚 API Documentation:"
 echo "   • FastAPI Docs:     http://localhost:8001/docs"

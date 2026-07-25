@@ -101,6 +101,24 @@ def _estimate_num_ctx(*texts: str, output_budget: int = NUM_CTX_OUTPUT_BUDGET) -
     )
 
 
+# Every keyword-substring intent check below (_wants_verbatim,
+# _wants_page_count, _wants_filename, _wants_upload_date,
+# _wants_chunk_count, _wants_raw_page_content's analytical check) matches
+# via plain substring containment, which is spacing-sensitive. Korean has
+# no strict rule about spacing compound phrases apart — "몇 페이지" and
+# "몇페이지" are both natural, equally valid ways to write the same
+# question — so a keyword list with only one spacing variant silently
+# misses the other (observed live: "이 문서는 총 몇페이지야?" fell through
+# the page-count short-circuit entirely and went to the LLM, because only
+# "몇 페이지" was listed). Stripping whitespace from both the question and
+# the keyword before comparing makes the match spacing-invariant.
+_WHITESPACE_RE = re.compile(r'\s+')
+
+
+def _normalize_for_keyword_match(text: str) -> str:
+    return _WHITESPACE_RE.sub('', text.lower())
+
+
 # Keywords signaling the user wants raw source text reproduced as-is
 # (line-by-line transcription/extraction), not a synthesized/summarized
 # answer. The default chain-of-thought prompt actively pushes the model to
@@ -116,8 +134,11 @@ VERBATIM_INTENT_KEYWORDS = [
 
 def _wants_verbatim(question: str) -> bool:
     """Detect requests for a verbatim line-by-line reproduction rather than a synthesized answer."""
-    lowered = question.lower()
-    return any(keyword.lower() in lowered for keyword in VERBATIM_INTENT_KEYWORDS)
+    normalized = _normalize_for_keyword_match(question)
+    return any(
+        _normalize_for_keyword_match(keyword) in normalized
+        for keyword in VERBATIM_INTENT_KEYWORDS
+    )
 
 
 # Shared instruction text for line-by-line reproduction, used by both the
@@ -306,23 +327,35 @@ CHUNK_COUNT_KEYWORDS = [
 
 
 def _wants_page_count(question: str) -> bool:
-    lowered = question.lower()
-    return any(keyword.lower() in lowered for keyword in PAGE_COUNT_KEYWORDS)
+    normalized = _normalize_for_keyword_match(question)
+    return any(
+        _normalize_for_keyword_match(keyword) in normalized
+        for keyword in PAGE_COUNT_KEYWORDS
+    )
 
 
 def _wants_filename(question: str) -> bool:
-    lowered = question.lower()
-    return any(keyword.lower() in lowered for keyword in FILENAME_KEYWORDS)
+    normalized = _normalize_for_keyword_match(question)
+    return any(
+        _normalize_for_keyword_match(keyword) in normalized
+        for keyword in FILENAME_KEYWORDS
+    )
 
 
 def _wants_upload_date(question: str) -> bool:
-    lowered = question.lower()
-    return any(keyword.lower() in lowered for keyword in UPLOAD_DATE_KEYWORDS)
+    normalized = _normalize_for_keyword_match(question)
+    return any(
+        _normalize_for_keyword_match(keyword) in normalized
+        for keyword in UPLOAD_DATE_KEYWORDS
+    )
 
 
 def _wants_chunk_count(question: str) -> bool:
-    lowered = question.lower()
-    return any(keyword.lower() in lowered for keyword in CHUNK_COUNT_KEYWORDS)
+    normalized = _normalize_for_keyword_match(question)
+    return any(
+        _normalize_for_keyword_match(keyword) in normalized
+        for keyword in CHUNK_COUNT_KEYWORDS
+    )
 
 
 # Ordered (predicate, label, per-pdf line formatter) list checked in
@@ -385,8 +418,11 @@ def _wants_raw_page_content(question: str) -> bool:
     page text directly, instead of being handed to the LLM."""
     if _wants_translation(question):
         return False
-    lowered = question.lower()
-    return not any(keyword.lower() in lowered for keyword in _ANALYTICAL_INTENT_KEYWORDS)
+    normalized = _normalize_for_keyword_match(question)
+    return not any(
+        _normalize_for_keyword_match(keyword) in normalized
+        for keyword in _ANALYTICAL_INTENT_KEYWORDS
+    )
 
 
 # Heuristics below catch two failure modes observed from qwen3:14b on the
@@ -1066,6 +1102,7 @@ class RAGService:
                         "pdf_name": doc.metadata.get("pdf_name", "Unknown"),
                         "pdf_id": doc.metadata.get("pdf_id", ""),
                         "chunk_index": doc.metadata.get("chunk_index", 0),
+                        "source_page": doc.metadata.get("source_page"),
                     }
                     for doc in all_docs
                 ]
@@ -1218,7 +1255,8 @@ Think through each step carefully, showing your reasoning process."""
             {
                 "pdf_name": doc.metadata.get("pdf_name"),
                 "pdf_id": doc.metadata.get("pdf_id"),
-                "chunk_index": doc.metadata.get("chunk_index", 0)
+                "chunk_index": doc.metadata.get("chunk_index", 0),
+                "source_page": doc.metadata.get("source_page"),
             }
             for doc in all_docs[:context_limit]
         ]

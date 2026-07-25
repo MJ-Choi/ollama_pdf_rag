@@ -429,6 +429,14 @@ def test_wants_page_count():
     assert _wants_page_count("이 문서를 요약해줘") is False
 
 
+def test_wants_page_count_matches_regardless_of_korean_spacing():
+    # Regression test: "몇페이지" (no space) fell through the short-circuit
+    # entirely and reached the LLM, because only the spaced "몇 페이지" form
+    # was listed — Korean has no strict rule requiring a space here, so both
+    # spacings are equally natural phrasing for the same question.
+    assert _wants_page_count("이 문서는 총 몇페이지야?") is True
+
+
 def test_query_multi_pdf_answers_page_count_without_llm():
     # The LLM only ever sees chunked page TEXT as context, never page_count
     # metadata, so it can never answer this correctly on its own — must be

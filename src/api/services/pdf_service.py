@@ -75,7 +75,7 @@ class PDFService:
 
         # Create vector DB collection
         collection_name = f"pdf_{abs(hash(file.filename + pdf_id))}"
-        vector_db = self.vector_store.create_vector_db(
+        self.vector_store.create_vector_db(
             documents=chunks,
             collection_name=collection_name
         )

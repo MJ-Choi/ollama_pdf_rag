@@ -1,5 +1,4 @@
 """FastAPI dependencies for dependency injection."""
-from sqlalchemy.orm import Session
 from .database import SessionLocal
 from .services.pdf_service import PDFService
 from .services.rag_service import RAGService

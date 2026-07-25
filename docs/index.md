@@ -11,7 +11,7 @@ Welcome to the documentation for Ollama PDF RAG — a powerful, privacy-first ap
 | Feature | Benefit |
 |---------|---------|
 | 🔒 **100% Local** | Your data never leaves your machine |
-| 🚀 **Two UIs** | Modern Next.js app OR classic Streamlit |
+| 🚀 **Modern UI** | Next.js chat app with a built-in PDF page viewer |
 | 📄 **Multi-PDF Support** | Query across multiple documents |
 | 🧠 **Smart Retrieval** | Multi-query expansion for better results |
 | ⚡ **Fast API** | FastAPI backend for production use |
@@ -22,10 +22,9 @@ Welcome to the documentation for Ollama PDF RAG — a powerful, privacy-first ap
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        USER INTERFACE                        │
-├─────────────────────────────┬───────────────────────────────┤
-│     Next.js (Modern UI)     │      Streamlit (Classic)      │
-│     localhost:3000          │      localhost:8501           │
-└─────────────────────────────┴───────────────────────────────┘
+├───────────────────────────────────────────────────────────────┤
+│                     Next.js (localhost:3000)                  │
+└─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -71,9 +70,6 @@ ollama pull nomic-embed-text
 
 ### Next.js Modern Interface
 ![Next.js UI with PDF Chat](assets/pdf-chat-response.png)
-
-### Streamlit Classic Interface
-![Streamlit UI](assets/st_app_ui.png)
 
 ## 📖 Documentation
 

@@ -1,12 +1,12 @@
 # 🤖 Chat with PDF locally using Ollama + LangChain
 
-A local RAG (Retrieval Augmented Generation) application that lets you chat with your PDF documents using Ollama and LangChain — including scanned/image-based PDFs via OCR. Includes a Next.js web app (primary), a Streamlit interface, and Jupyter notebooks for experimentation. All processing happens on your machine; no data leaves your device.
+A local RAG (Retrieval Augmented Generation) application that lets you chat with your PDF documents using Ollama and LangChain — including scanned/image-based PDFs via OCR. Includes a Next.js web app and Jupyter notebooks for experimentation. All processing happens on your machine; no data leaves your device.
 
 [![Python Tests](https://github.com/MJ-Choi/ollama_pdf_rag/actions/workflows/tests.yml/badge.svg)](https://github.com/MJ-Choi/ollama_pdf_rag/actions/workflows/tests.yml)
 
 ## About This Project
 
-This is a **fork** of [tonykipkemboi/ollama_pdf_rag](https://github.com/tonykipkemboi/ollama_pdf_rag) — a local RAG chat-with-PDF app by [Tony Kipkemboi](https://tonykipkemboi.com). The original project provides the core RAG pipeline, the Next.js/Streamlit UIs, and the FastAPI backend that this fork builds on.
+This is a **fork** of [tonykipkemboi/ollama_pdf_rag](https://github.com/tonykipkemboi/ollama_pdf_rag) — a local RAG chat-with-PDF app by [Tony Kipkemboi](https://tonykipkemboi.com). The original project provides the core RAG pipeline, the Next.js UI, and the FastAPI backend that this fork builds on.
 
 This fork adds a full OCR and translation pipeline on top of that foundation, built for the primary use case of chatting with **scanned, image-based PDFs in Chinese** (originally: knitting patterns) and translating them into Korean — while remaining general-purpose for any scanned or native-text PDF.
 
@@ -26,13 +26,8 @@ This fork adds a full OCR and translation pipeline on top of that foundation, bu
 
 ## 🖼️ Screenshots
 
-### Next.js Interface (Recommended)
 ![Next.js UI](nextjs_ui.png)
 *Modern chat interface with PDF management, source citations, and reasoning steps*
-
-### Streamlit Interface
-![Streamlit UI](st_app_ui.png)
-*Classic Streamlit interface with PDF viewer and chat functionality*
 
 ## 🏗️ Project Structure
 ```
@@ -42,9 +37,6 @@ ollama_pdf_rag/
 │   │   ├── routers/          # API endpoints
 │   │   ├── services/         # Business logic (RAG orchestration, PDF/OCR processing)
 │   │   └── main.py           # API entry point
-│   ├── app/                  # Streamlit application
-│   │   ├── components/       # UI components
-│   │   └── main.py           # Streamlit entry point
 │   └── core/                 # Core RAG + OCR functionality
 │       ├── document.py       # PDF processing + scanned-PDF/OCR fallback detection
 │       ├── text_extractor.py # OCR extraction for scanned PDFs (deepseek-ocr:3b vision-LLM via Ollama + pdf2image)
@@ -63,7 +55,6 @@ ollama_pdf_rag/
 ├── notebooks/                # Jupyter notebooks
 ├── tests/                    # Unit tests
 ├── docs/                     # Documentation
-├── run.py                    # Streamlit runner
 ├── run_api.py                # FastAPI runner
 └── start_all.sh              # Start all services
 ```
@@ -136,14 +127,7 @@ Or use the convenience script:
 | FastAPI Backend | http://localhost:8001 | REST API |
 | API Documentation | http://localhost:8001/docs | Swagger UI |
 
-#### Option 2: Streamlit Interface
-
-```bash
-python run.py
-# Runs on http://localhost:8501
-```
-
-#### Option 3: Jupyter Notebook
+#### Option 2: Jupyter Notebook
 
 ```bash
 jupyter notebook
@@ -157,13 +141,6 @@ Open `notebooks/experiments/updated_rag_notebook.ipynb` to experiment with the c
 3. **Select Model** — Choose from your locally available Ollama models
 4. **Ask Questions** — Type your question and get answers with source citations. Ask to translate a page range or the whole document for a full, line-by-line translation
 5. **View Reasoning** — See the AI's thinking process and retrieved chunks
-
-### Using the Streamlit Interface
-1. **Upload PDF** — Use the file uploader or toggle "Use sample PDF"
-2. **Select Model** — Choose from available Ollama models
-3. **Ask Questions** — Chat with your PDF through the interface
-4. **Adjust Display** — Use the zoom slider for PDF visibility
-5. **Clean Up** — Delete collections when switching documents
 
 ### API Reference
 
@@ -212,7 +189,7 @@ python scripts/cleanup_orphans.py --apply
 - **Ollama not responding**: Ensure Ollama is running (`ollama serve`)
 - **Model not found**: Pull models with `ollama pull <model-name>`
 - **No chunks retrieved**: Re-upload PDFs to rebuild the vector database
-- **Port conflicts**: Check if ports 3000, 8001, or 8501 are in use
+- **Port conflicts**: Check if ports 3000 or 8001 are in use
 - **Garbled/wrong OCR text on a scanned PDF**: Confirm `ollama pull deepseek-ocr:3b` completed successfully, then try the re-OCR (refresh) button on that PDF
 
 ### Common Errors
