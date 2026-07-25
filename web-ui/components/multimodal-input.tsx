@@ -139,6 +139,7 @@ function PureMultimodalInput({
 
     sendMessage({
       role: "user",
+      metadata: { createdAt: new Date().toISOString() },
       parts: [
         ...attachments.map((attachment) => ({
           type: "file" as const,

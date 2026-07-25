@@ -1,6 +1,7 @@
 "use client";
 import type { UseChatHelpers } from "@ai-sdk/react";
 import equal from "fast-deep-equal";
+import { format } from "date-fns";
 import { memo, useState } from "react";
 import type { Vote } from "@/lib/db/schema";
 import type { ChatMessage } from "@/lib/types";
@@ -118,8 +119,20 @@ const PurePreviewMessage = ({
 
             if (type === "text") {
               if (mode === "view") {
+                const timestamp = message.metadata?.createdAt;
+
                 return (
-                  <div key={key}>
+                  <div
+                    className={cn("flex items-end gap-2", {
+                      "justify-end": message.role === "user",
+                    })}
+                    key={key}
+                  >
+                    {timestamp && (
+                      <span className="shrink-0 pb-1 text-muted-foreground text-xs">
+                        {format(new Date(timestamp), "HH:mm")}
+                      </span>
+                    )}
                     <MessageContent
                       className={cn({
                         "w-fit break-words rounded-2xl px-3 py-2 text-right text-white":

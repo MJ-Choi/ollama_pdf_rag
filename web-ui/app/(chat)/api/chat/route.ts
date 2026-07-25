@@ -251,6 +251,11 @@ It looks like your question might be about a document, but you haven't selected 
 
     const messageStream = createUIMessageStream({
       execute: async ({ writer }) => {
+        writer.write({
+          type: "message-metadata",
+          messageMetadata: { createdAt: new Date().toISOString() },
+        });
+
         // Write reasoning steps progressively with delay for streaming effect
         if (reasoningSteps && reasoningSteps.length > 0) {
           console.log("Writing reasoning steps progressively:", reasoningSteps.length);
@@ -314,6 +319,11 @@ It looks like your question might be about a document, but you haven't selected 
     // Return error as a UI message stream
     const errorStream = createUIMessageStream({
       execute: async ({ writer }) => {
+        writer.write({
+          type: "message-metadata",
+          messageMetadata: { createdAt: new Date().toISOString() },
+        });
+
         // Write error chunk
         writer.write({
           type: "error",

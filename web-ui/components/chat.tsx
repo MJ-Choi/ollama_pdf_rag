@@ -147,6 +147,7 @@ export function Chat({
     if (query && !hasAppendedQuery) {
       sendMessage({
         role: "user" as const,
+        metadata: { createdAt: new Date().toISOString() },
         parts: [{ type: "text", text: query }],
       });
 
