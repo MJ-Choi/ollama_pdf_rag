@@ -24,6 +24,7 @@ import { FileText, Trash2, Square, CheckSquare, RefreshCw, Eye } from "lucide-re
 import { fetcher } from "@/lib/utils";
 import { usePDFSelection } from "@/hooks/use-pdf-selection";
 import { usePdfViewer } from "@/hooks/use-pdf-viewer";
+import { PDFUpload } from "./pdf-upload";
 import { Button } from "./ui/button";
 
 interface PDF {
@@ -161,7 +162,9 @@ export function SidebarPDFs() {
         <SidebarGroupContent>
           <div className="flex w-full flex-col items-center justify-center gap-2 px-2 py-4 text-sm text-zinc-500">
             <span>No PDFs uploaded yet.</span>
-            <span className="text-xs">Use the 📎 button to upload.</span>
+          </div>
+          <div className="px-2 pb-2">
+            <PDFUpload onUploadComplete={() => mutate()} />
           </div>
         </SidebarGroupContent>
       </SidebarGroup>
@@ -201,6 +204,9 @@ export function SidebarPDFs() {
             ⚠️ Select PDFs to use as context
           </div>
         )}
+        <div className="px-2 pb-2">
+          <PDFUpload onUploadComplete={() => mutate()} />
+        </div>
         <SidebarGroupContent>
           <SidebarMenu>
             {pdfs.map((pdf) => {
