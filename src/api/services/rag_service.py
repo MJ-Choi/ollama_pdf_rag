@@ -25,6 +25,18 @@ from ...core.text_extractor import TextExtractor, CJK_OCR_LANGUAGE
 
 logger = logging.getLogger(__name__)
 
+
+def _log_step(reasoning_steps: List[str], message: str) -> None:
+    """Append to the request-scoped reasoning_steps list AND mirror to the
+    server logger, so page-loop retry/failure progress is visible in the
+    backend console in real time — reasoning_steps only reaches the caller
+    inside the final JSON response, so a request killed/interrupted mid-way
+    (e.g. a long multi-page translation) would otherwise leave no trace of
+    what happened up to that point."""
+    reasoning_steps.append(message)
+    logger.info(message)
+
+
 # Below this many total chunks across the selected PDF(s), skip similarity
 # search entirely and feed the model the ENTIRE document instead. Retrieval
 # (MultiQueryRetriever, top-k) is a lossy approximation meant for large
@@ -59,6 +71,19 @@ MAX_CONTINUATION_ATTEMPTS = 2
 # a *successful* call that was merely cut off by num_ctx.
 MAX_PAGE_RETRY_ATTEMPTS = 2
 PAGE_RETRY_BACKOFF_SECONDS = 2
+
+# NOTE: a higher repeat_penalty (1.3) was tried here to fight occasional
+# duplicate-block generation on repetitive knitting-instruction pages, but
+# was reverted — live testing showed it pushed qwen3:14b into a WORSE failure
+# mode on the exact same content: avoiding legitimate repeated tokens (코/针)
+# hard enough that it substituted low-probability tokens instead, including
+# switching to a different language entirely mid-line (observed: a stray
+# Russian word) and mangling stitch-count notation (e.g. "[69针织]" instead
+# of "[69코]"). The duplicate-generation failure mode this was meant to fix
+# is already handled safely by _looks_duplicated()'s retry loop plus the
+# inline/summary warning markers in _translate_pages() — silent duplication
+# never reaches the user unflagged. A subtly wrong translation (malformed
+# units, an unnoticed foreign word) is a worse outcome to risk than that.
 
 
 def _estimate_num_ctx(*texts: str, output_budget: int = NUM_CTX_OUTPUT_BUDGET) -> int:
@@ -212,8 +237,38 @@ def _wants_verbatim_or_translation(question: str) -> bool:
 
 def _line_instructions_for(question: str) -> str:
     """Pick strict original+translation interleaving instructions when the
-    question asks for a translation, vs plain verbatim reproduction otherwise."""
-    return TRANSLATION_LINE_INSTRUCTIONS if _wants_translation(question) else VERBATIM_INSTRUCTIONS
+    question asks for a translation, vs plain verbatim reproduction otherwise.
+
+    For a Korean-target translation, an explicit language directive is
+    appended on top of TRANSLATION_LINE_INSTRUCTIONS. Observed live: the same
+    page content, translated in isolation, came back correctly in Korean on
+    the first attempt — but translated as the LAST page of an 11-page loop,
+    it came back in English 3 times in a row (initial + both retries), even
+    though the retry-correction message already names 한국어 explicitly. The
+    per-page system message never stated the target language up front — the
+    model only saw it if it inferred it from the user's question text — so
+    the first (and, for this content, every) attempt had no hard requirement
+    to violate. Stating it directly in the instructions gives every attempt
+    the same explicit constraint the retry message alone wasn't enough to
+    enforce."""
+    if not _wants_translation(question):
+        return VERBATIM_INSTRUCTIONS
+    if _expects_korean_output(question):
+        return TRANSLATION_LINE_INSTRUCTIONS + (
+            " Every translation line MUST be written in Korean (한글/Hangul) — "
+            "never in English, never in the source language, and never "
+            "romanized. This applies to every single line, including the "
+            "very last lines of the very last page — do not switch language "
+            "or drop into a summary/closing remark near the end. If a source "
+            "line is OCR garbage/noise with no coherent meaning (stray "
+            "symbols, watermark fragments, unreadable characters) that "
+            "genuinely cannot be translated, reproduce it verbatim as both "
+            "the original line and the line below it — do NOT invent an "
+            "English gloss, guess, or commentary trying to interpret it; "
+            "an untranslated noise line is correct, a fabricated English "
+            "one is not."
+        )
+    return TRANSLATION_LINE_INSTRUCTIONS
 
 
 # Metadata questions (page count, filename, upload date, chunk count) are
@@ -568,13 +623,13 @@ class RAGService:
             if done_reason == "stop" or not chunk:
                 return full_text, False
             if attempt == MAX_CONTINUATION_ATTEMPTS:
-                reasoning_steps.append(
+                _log_step(reasoning_steps,
                     f"⚠️ {label}응답이 잘렸습니다 (done_reason={done_reason}) — "
                     f"{MAX_CONTINUATION_ATTEMPTS}회 이어쓰기 후에도 미완료"
                 )
                 return full_text, True
 
-            reasoning_steps.append(
+            _log_step(reasoning_steps,
                 f"↪️ {label}응답이 중간에 잘림 (done_reason={done_reason}) — "
                 f"이어쓰기 {attempt + 1}/{MAX_CONTINUATION_ATTEMPTS}"
             )
@@ -605,7 +660,7 @@ class RAGService:
             )
             if getattr(ollama_response.message, "thinking", None):
                 thinking_text = ollama_response.message.thinking
-                reasoning_steps.append(
+                _log_step(reasoning_steps,
                     f"💡 Model's chain-of-thought:\n{thinking_text[:500]}"
                     f"{'...' if len(thinking_text) > 500 else ''}"
                 )
@@ -616,11 +671,11 @@ class RAGService:
             if done_reason == "stop" or not chunk:
                 return full_text, False
             if attempt == MAX_CONTINUATION_ATTEMPTS:
-                reasoning_steps.append(f"⚠️ 응답이 잘렸습니다 (done_reason={done_reason}) — "
+                _log_step(reasoning_steps, f"⚠️ 응답이 잘렸습니다 (done_reason={done_reason}) — "
                                         f"{MAX_CONTINUATION_ATTEMPTS}회 이어쓰기 후에도 미완료")
                 return full_text, True
 
-            reasoning_steps.append(
+            _log_step(reasoning_steps,
                 f"↪️ 응답이 중간에 잘림 (done_reason={done_reason}) — "
                 f"이어쓰기 {attempt + 1}/{MAX_CONTINUATION_ATTEMPTS}"
             )
@@ -639,7 +694,7 @@ class RAGService:
         question: str,
         model: str,
         reasoning_steps: List[str],
-    ) -> Tuple[str, bool, List[int]]:
+    ) -> Tuple[str, bool, List[int], List[int]]:
         """Reproduce/translate a multi-page document one page at a time so each
         call's required OUTPUT size is bounded by a single page's content
         instead of the whole document — the actual fix for full-document
@@ -655,17 +710,29 @@ class RAGService:
         translation is kept. Nothing gets thrown away because one page had a
         bad run.
 
-        Returns (concatenated_answer, any_page_truncated, failed_page_numbers).
-        failed_page_numbers is empty when every page eventually succeeded.
+        A page can also exhaust every retry while still producing SOME output
+        that just never passes format validation (duplicated / wrong-language /
+        non-interleaved) — e.g. the model keeps echoing the source verbatim
+        instead of translating it. That page's last attempt is kept (not
+        discarded, same "never lose completed work" policy as a hard failure)
+        but is now marked inline in the returned text — previously this only
+        showed up as a reasoning_steps entry the caller never surfaced, so a
+        page that silently stayed untranslated after 2 failed retries looked
+        identical to a successfully translated one in the final answer.
+
+        Returns (concatenated_answer, any_page_truncated, failed_page_numbers,
+        format_issue_page_numbers). Both page-number lists are empty when
+        every page both succeeded and passed validation.
         """
         page_outputs: List[str] = []
         any_truncated = False
         failed_pages: List[int] = []
+        format_issue_pages: List[int] = []
 
         for i, doc in enumerate(docs):
             source = doc.metadata.get("pdf_name", "Unknown")
             page_label = f"{i + 1}/{len(docs)}"
-            reasoning_steps.append(f"📄 페이지 {page_label} 처리 중... ({source})")
+            _log_step(reasoning_steps, f"📄 페이지 {page_label} 처리 중... ({source})")
 
             page_num_ctx = _estimate_num_ctx(
                 doc.page_content, question, self.priority_context,
@@ -717,43 +784,69 @@ class RAGService:
                     break  # out of retries — handled below
 
                 if last_error is not None:
-                    reasoning_steps.append(
+                    _log_step(reasoning_steps,
                         f"⚠️ 페이지 {page_label} 처리 중 오류 ({last_error}) — "
                         f"재시도 {retry + 1}/{MAX_PAGE_RETRY_ATTEMPTS}"
                     )
                     attempt_messages = messages
                     time.sleep(PAGE_RETRY_BACKOFF_SECONDS)
                 else:
-                    reasoning_steps.append(
+                    _log_step(reasoning_steps,
                         f"⚠️ 페이지 {page_label} 형식 검증 실패 ({format_issue}) — "
                         f"재시도 {retry + 1}/{MAX_PAGE_RETRY_ATTEMPTS}"
                     )
-                    attempt_messages = messages + [
-                        AIMessage(content=page_text),
-                        HumanMessage(content=(
+                    if format_issue == "요청한 언어(한국어)로 번역되지 않음":
+                        # Dedicated, more forceful retry message for language
+                        # drift specifically — the shared generic message
+                        # below already names 한국어 once, but that alone was
+                        # observed to still fail 2/2 retries on a page whose
+                        # content translated fine in isolation. Repeating the
+                        # requirement in isolation, without the other format
+                        # rules competing for attention, gives it a better
+                        # shot on the retry.
+                        correction = (
+                            f"That output was rejected: {format_issue}. Your "
+                            "translation lines were not in Korean. Redo this "
+                            "page from scratch. EVERY translation line must "
+                            "be written in Korean (한글/Hangul) — not English, "
+                            "not the source language, not romanized. Keep the "
+                            "same original-line-then-translation-line "
+                            "interleaved format, with no duplicated content."
+                        )
+                    else:
+                        correction = (
                             f"That output was rejected: {format_issue}. Redo this page "
                             "from scratch following the exact original-line-then-"
                             "translation-line interleaved format shown earlier, with "
                             "no duplicated content, translating into the language the "
                             "user asked for (한국어, unless they explicitly requested "
                             "another language)."
-                        )),
+                        )
+                    attempt_messages = messages + [
+                        AIMessage(content=page_text),
+                        HumanMessage(content=correction),
                     ]
 
             if last_error is not None:
                 failed_pages.append(i + 1)
                 page_outputs.append(f"⚠️ [페이지 {page_label} 처리 실패: {last_error}]")
-                reasoning_steps.append(f"❌ 페이지 {page_label} 최종 실패 — 다음 페이지로 진행")
+                _log_step(reasoning_steps, f"❌ 페이지 {page_label} 최종 실패 — 다음 페이지로 진행")
                 continue
 
-            if format_issue is not None:
-                reasoning_steps.append(f"⚠️ 페이지 {page_label} 형식 문제 남음 ({format_issue}) — 결과는 유지")
-
             any_truncated = any_truncated or truncated
-            page_outputs.append(page_text.strip())
-            reasoning_steps.append(f"✅ 페이지 {page_label} 완료")
+            if format_issue is not None:
+                format_issue_pages.append(i + 1)
+                _log_step(reasoning_steps, f"⚠️ 페이지 {page_label} 형식 문제 남음 ({format_issue}) — 결과는 유지")
+                page_outputs.append(
+                    f"⚠️ [페이지 {page_label} 번역 검증 실패 — {format_issue} "
+                    f"({MAX_PAGE_RETRY_ATTEMPTS}회 재시도 후에도 미해결, 아래는 마지막 시도 결과이므로 "
+                    "부정확하거나 미완성일 수 있습니다]\n" + page_text.strip()
+                )
+            else:
+                page_outputs.append(page_text.strip())
+            _log_step(reasoning_steps, f"✅ 페이지 {page_label} 완료")
 
-        return "\n\n".join(page_outputs), any_truncated, failed_pages
+        return "\n\n".join(page_outputs), any_truncated, failed_pages, format_issue_pages
 
     def query_multi_pdf(
         self,
@@ -997,23 +1090,31 @@ class RAGService:
         supports_thinking = any(tm in model.lower() for tm in thinking_models)
         use_thinking = supports_thinking and not verbatim_mode
 
-        # A large multi-page verbatim/translation request is translated one
-        # page at a time instead of in one giant call, so no single call's
-        # required output can exceed a bound tied to one page's content —
-        # this is what actually fixes full-document translations silently
-        # cutting off partway through (see _translate_pages docstring).
-        use_page_loop = use_full_context and verbatim_mode and len(all_docs[:context_limit]) > 1
+        # Every verbatim/translation request over full-document context goes
+        # through the per-page loop, including a single page — not just
+        # "more than one page" as this used to require. _translate_pages()
+        # is also where the only format validation lives (duplicate output,
+        # untranslated/wrong-language output, non-interleaved output), each
+        # with up to MAX_PAGE_RETRY_ATTEMPTS retries; the plain single-call
+        # path below has none of that. A single-page range request (e.g.
+        # "11페이지만 번역해줘") used to skip validation entirely and could
+        # silently return the original text completely untranslated with no
+        # retry and no warning — confirmed live: a one-page translation
+        # request returned 0% Hangul output while reasoning_steps showed no
+        # format check ever ran.
+        use_page_loop = use_full_context and verbatim_mode and len(all_docs[:context_limit]) >= 1
 
         if use_page_loop:
             reasoning_steps.append(
-                f"🔀 다중 페이지 verbatim/번역 요청 감지 — 페이지별 생성 루프 사용 "
-                f"({len(all_docs[:context_limit])}페이지, 응답 잘림 방지 + 사고모드 비활성화)"
+                f"🔀 verbatim/번역 요청 감지 — 페이지별 생성 루프 사용 "
+                f"({len(all_docs[:context_limit])}페이지, 응답 잘림 방지 + 형식 검증/재시도 + 사고모드 비활성화)"
             )
-            response, truncated, failed_pages = self._translate_pages(
+            response, truncated, failed_pages, format_issue_pages = self._translate_pages(
                 all_docs[:context_limit], question, model, reasoning_steps
             )
         else:
             failed_pages = []
+            format_issue_pages = []
             if verbatim_mode:
                 # Reproduce (and, if requested, translate) source lines as-is —
                 # explicitly forbid summarizing, paraphrasing, or reorganizing.
@@ -1125,11 +1226,24 @@ Think through each step carefully, showing your reasoning process."""
             )
             reasoning_steps.append(f"⚠️ 페이지 {page_list} 최종 실패 — 나머지는 정상 반환")
 
+        # Distinct from failed_pages: the call succeeded and produced text,
+        # but that text never passed format validation even after retries
+        # (e.g. still untranslated). Each such page is already marked inline
+        # in `response` by _translate_pages — this adds a summary note so the
+        # issue isn't buried at the bottom of a long multi-page answer.
+        if format_issue_pages:
+            page_list = ", ".join(str(p) for p in format_issue_pages)
+            response = response + (
+                f"\n\n⚠️ [참고: 페이지 {page_list}는 형식 검증(번역 누락/중복/미교차)을 통과하지 못한 "
+                "채로 반환되었습니다 — 해당 페이지는 원문이 그대로 남아있거나 부정확할 수 있습니다.]"
+            )
+            reasoning_steps.append(f"⚠️ 페이지 {page_list} 형식 검증 최종 실패 — 결과에 경고 표시로 유지")
+
         if truncated:
             response = response + "\n\n⚠️ [참고: 이 답변은 완전히 생성되지 못했을 수 있습니다 — 응답이 중간에 잘렸습니다.]"
             reasoning_steps.append("⚠️ 답변이 불완전하게 생성되었습니다 (이어쓰기 시도 후에도 완료되지 않음)")
 
-        is_incomplete = bool(failed_pages) or truncated
+        is_incomplete = bool(failed_pages) or bool(format_issue_pages) or truncated
         if not is_incomplete:
             reasoning_steps.append("✨ Answer generated successfully!")
 

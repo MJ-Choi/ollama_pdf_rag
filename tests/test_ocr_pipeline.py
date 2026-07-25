@@ -334,10 +334,19 @@ def test_normalize_korean_counts_with_attached_particle():
 
 def test_line_instructions_for_translation_request():
     instructions = _line_instructions_for("중국어 도안을 한국어로 번역해줘")
-    assert instructions == TRANSLATION_LINE_INSTRUCTIONS
+    # A Korean-target translation appends an explicit language directive on
+    # top of the base instructions, so it's a superset, not an exact match.
+    assert instructions.startswith(TRANSLATION_LINE_INSTRUCTIONS)
     # The whole point of this instruction set: every line gets its own
     # translation immediately below it, never batched into separate blocks.
     assert "never batch all original lines" in instructions
+    assert "MUST be written in Korean" in instructions
+
+
+def test_line_instructions_for_non_korean_translation_request_has_no_language_directive():
+    instructions = _line_instructions_for("이 문서를 영어로 번역해줘")
+    assert instructions == TRANSLATION_LINE_INSTRUCTIONS
+    assert "MUST be written in Korean" not in instructions
 
 
 def test_line_instructions_for_plain_verbatim_request():
@@ -549,7 +558,7 @@ def test_query_multi_pdf_propagates_truncated_flag_from_translate_pages():
 
     with patch("src.api.services.rag_service.Chroma", return_value=fake_vector_db), \
          patch("src.api.services.rag_service.OllamaEmbeddings"), \
-         patch.object(RAGService, "_translate_pages", return_value=("번역 결과", True, [])):
+         patch.object(RAGService, "_translate_pages", return_value=("번역 결과", True, [], [])):
         answer, _, _, truncated = service.query_multi_pdf(
             question="이 문서를 한국어로 번역해줘", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
         )
@@ -579,13 +588,44 @@ def test_query_multi_pdf_propagates_truncated_flag_from_failed_pages():
 
     with patch("src.api.services.rag_service.Chroma", return_value=fake_vector_db), \
          patch("src.api.services.rag_service.OllamaEmbeddings"), \
-         patch.object(RAGService, "_translate_pages", return_value=("페이지1 결과", False, [2])):
+         patch.object(RAGService, "_translate_pages", return_value=("페이지1 결과", False, [2], [])):
         answer, _, _, truncated = service.query_multi_pdf(
             question="이 문서를 한국어로 번역해줘", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
         )
 
     assert truncated is True
     assert "처리하지 못했습니다" in answer
+
+
+def test_query_multi_pdf_propagates_truncated_flag_from_format_issue_pages():
+    # A page that exhausted retries without passing format validation (still
+    # untranslated/duplicated/non-interleaved) also makes the overall answer
+    # incomplete, distinct from both a hard failure and a truncated response.
+    from types import SimpleNamespace
+
+    service = RAGService()
+    fake_pdf = SimpleNamespace(
+        name="test.pdf", pdf_id="pdf_1", page_count=2, doc_count=2,
+        collection_name="col_1", file_path=None,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = [fake_pdf]
+
+    fake_vector_db = MagicMock()
+    fake_vector_db.get.return_value = {
+        "documents": ["page 1 content", "page 2 content"],
+        "metadatas": [{"source_page": 1}, {"source_page": 2}],
+    }
+
+    with patch("src.api.services.rag_service.Chroma", return_value=fake_vector_db), \
+         patch("src.api.services.rag_service.OllamaEmbeddings"), \
+         patch.object(RAGService, "_translate_pages", return_value=("페이지1 결과", False, [], [1])):
+        answer, _, _, truncated = service.query_multi_pdf(
+            question="이 문서를 한국어로 번역해줘", model="qwen3:14b", pdf_ids=["pdf_1"], db=db
+        )
+
+    assert truncated is True
+    assert "형식 검증" in answer
 
 
 def test_estimate_num_ctx_floor_applies_regardless_of_output_budget():
@@ -659,12 +699,15 @@ def test_translate_pages_calls_once_per_page_in_order():
         RAGService, "_invoke_with_continuation",
         side_effect=[("번역1", False), ("번역2", False), ("번역3", False)],
     ) as mock_invoke:
-        result, truncated, failed_pages = service._translate_pages(docs, "번역해줘", "qwen3:14b", [])
+        result, truncated, failed_pages, format_issue_pages = service._translate_pages(
+            docs, "번역해줘", "qwen3:14b", []
+        )
 
     assert mock_invoke.call_count == 3
     assert result == "번역1\n\n번역2\n\n번역3"
     assert truncated is False
     assert failed_pages == []
+    assert format_issue_pages == []
     # Each call's system message should contain that page's own content, in order.
     for i, call in enumerate(mock_invoke.call_args_list):
         messages = call.args[1]
@@ -682,10 +725,13 @@ def test_translate_pages_propagates_truncation_from_any_page():
         RAGService, "_invoke_with_continuation",
         side_effect=[("ok", False), ("cut off", True)],
     ):
-        _, truncated, failed_pages = service._translate_pages(docs, "번역해줘", "qwen3:14b", [])
+        _, truncated, failed_pages, format_issue_pages = service._translate_pages(
+            docs, "번역해줘", "qwen3:14b", []
+        )
 
     assert truncated is True
     assert failed_pages == []
+    assert format_issue_pages == []
 
 
 def test_translate_pages_retries_a_hard_failure_then_succeeds():
@@ -697,7 +743,7 @@ def test_translate_pages_retries_a_hard_failure_then_succeeds():
         RAGService, "_invoke_with_continuation",
         side_effect=[RuntimeError("unexpected EOF"), ("복구됨", False)],
     ) as mock_invoke:
-        result, truncated, failed_pages = service._translate_pages(
+        result, truncated, failed_pages, format_issue_pages = service._translate_pages(
             docs, "번역해줘", "qwen3:14b", reasoning_steps
         )
 
@@ -705,6 +751,7 @@ def test_translate_pages_retries_a_hard_failure_then_succeeds():
     assert result == "복구됨"
     assert truncated is False
     assert failed_pages == []
+    assert format_issue_pages == []
     assert any("재시도" in s for s in reasoning_steps)
 
 
@@ -727,12 +774,13 @@ def test_translate_pages_keeps_earlier_pages_when_a_later_page_fails_permanently
             ("페이지2 완료", False),
         ],
     ) as mock_invoke, patch("time.sleep"):
-        result, truncated, failed_pages = service._translate_pages(
+        result, truncated, failed_pages, format_issue_pages = service._translate_pages(
             docs, "번역해줘", "qwen3:14b", reasoning_steps
         )
 
     assert mock_invoke.call_count == 5
     assert failed_pages == [2]  # 1-indexed
+    assert format_issue_pages == []
     # Pages 0 and 2's successful output must survive despite page 1 failing.
     assert "페이지0 완료" in result
     assert "페이지2 완료" in result
@@ -757,13 +805,14 @@ def test_translate_pages_retries_on_bad_format_then_succeeds():
         RAGService, "_invoke_with_continuation",
         side_effect=[(_BLOCK_FORMAT_TEXT, False), (_INTERLEAVED_TEXT, False)],
     ) as mock_invoke:
-        result, truncated, failed_pages = service._translate_pages(
+        result, truncated, failed_pages, format_issue_pages = service._translate_pages(
             docs, "중국어를 한국어로 번역해줘", "qwen3:14b", reasoning_steps
         )
 
     assert mock_invoke.call_count == 2
     assert result == _INTERLEAVED_TEXT
     assert failed_pages == []
+    assert format_issue_pages == []  # succeeded on retry, so no lingering issue
     assert any("형식 검증 실패" in s for s in reasoning_steps)
     # The retry attempt's messages should carry a corrective instruction.
     second_call_messages = mock_invoke.call_args_list[1].args[1]
@@ -779,11 +828,13 @@ def test_translate_pages_keeps_result_when_format_issue_persists_after_retries()
         RAGService, "_invoke_with_continuation",
         return_value=(_BLOCK_FORMAT_TEXT, False),
     ) as mock_invoke:
-        result, truncated, failed_pages = service._translate_pages(
+        result, truncated, failed_pages, format_issue_pages = service._translate_pages(
             docs, "중국어를 한국어로 번역해줘", "qwen3:14b", reasoning_steps
         )
 
     assert mock_invoke.call_count == MAX_PAGE_RETRY_ATTEMPTS + 1
-    assert result == _BLOCK_FORMAT_TEXT  # kept despite the unresolved format issue
+    assert _BLOCK_FORMAT_TEXT in result  # kept despite the unresolved format issue
+    assert "번역 검증 실패" in result  # but now marked inline, not silently returned as-is
     assert failed_pages == []  # a format issue is not treated as a hard failure
+    assert format_issue_pages == [1]  # ...but IS tracked separately for the caller
     assert any("형식 문제 남음" in s for s in reasoning_steps)

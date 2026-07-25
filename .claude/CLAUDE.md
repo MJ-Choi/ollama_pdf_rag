@@ -49,7 +49,7 @@ Ollama와 LangChain을 사용해 PDF 문서와 대화하는 완전 로컬 RAG(�
 3개 DB(ChromaDB, API DB, 프론트엔드 DB)의 스키마·구조·알려진 이슈는 @.claude/database.md 참조. 요약:
 - **벡터 DB**: ChromaDB (`data/vectors/`) — PDF 1개당 컬렉션 1개. ⚠️ 업로드 시점 OCR 결과가 박제됨(재-OCR은 그 질의에만 반영, 컬렉션 자체를 갱신하려면 `refresh_ocr`)
 - **원본 PDF**: `data/pdfs/uploads/` (`{pdf_id}_{파일명}`) — 재-OCR이 읽는 원본
-- **API DB**: SQLite `data/api.db` — PDF 메타데이터(`PDFMetadata`)만 관리. 채팅 기록은 여기 없음(2026-07-23 제거, 아래 "알려진 문제점" 6번 참조)
+- **API DB**: SQLite `data/api.db` — PDF 메타데이터(`PDFMetadata`)만 관리. 채팅 기록은 여기 없음 — 백엔드는 무상태 질의응답 엔진이고, 프론트 `chat.db`가 유일한 채팅 기록(2026-07-23 백엔드의 `ChatSession`/`ChatMessage` 저장 경로 전부 제거)
 - **프론트엔드 DB**: `web-ui/data/chat.db` (Drizzle ORM + better-sqlite3) — **유일한 채팅 기록**
 
 ## 개발 명령어
@@ -124,9 +124,11 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 
 ### 답변 생성: 잘림 방지 + 페이지별 번역 루프
 - 모든 생성 호출은 `_invoke_with_continuation()`(ChatOllama) 또는 `_invoke_ollama_chat_with_continuation()`(raw ollama, 씽킹 모델)을 거침 — Ollama의 `done_reason != "stop"`이면 최대 `MAX_CONTINUATION_ATTEMPTS`(2)회 이어쓰기 재시도, 그래도 미완이면 답변 텍스트에 ⚠️ 경고를 명시 (잘린 답변을 조용히 성공 처리하지 않음). `query_multi_pdf()`는 이 상태를 4번째 반환값 `truncated`(bool)로도 노출하고, API 응답의 `metadata.truncated`로 그대로 전달됨 — UI/외부 클라이언트가 텍스트 파싱 없이 판단 가능
-- `_wants_verbatim_or_translation()`(verbatim 키워드 또는 번역 키워드)이 참이면: (1) 씽킹 모드 비활성화(기계적 전사에 사고과정은 출력 예산 낭비), (2) 다중 페이지면 `_translate_pages()` — **페이지당 LLM 1회 호출**로 나눠 순서대로 이어붙임 (단일 대형 호출의 출력 한도 초과로 인한 잘림을 구조적으로 방지)
-- `_translate_pages()`는 페이지 단위로 격리됨: 하드 실패(Ollama 크래시 등)는 `MAX_PAGE_RETRY_ATTEMPTS`(2)회 재시도 후에도 실패하면 그 페이지만 실패 표시하고 계속 진행 — 완료된 페이지는 절대 유실되지 않음
-- 번역 페이지는 생성 후 구조 검증: `_looks_correctly_interleaved()`(원문/번역 블록 분리 또는 번역 누락 감지), `_looks_duplicated()`(중복 생성 감지 — 인접 블록 반복을 크기 1줄부터 스캔, **한글 줄이 포함된 중복만 플래그** — 번역 불가 OCR 잡음 줄이 원문/번역 자리에 똑같이 복사되는 정상 케이스는 재시도 낭비 없이 통과), `_looks_untranslated_output()`(타깃이 한국어인데 한글 비율 15% 미만이면 오역/미번역으로 간주 — 마지막 페이지 영어 드리프트 방지). 실패 시 교정 메시지와 함께 재시도, 소진 시 결과는 유지하고 플래그만
+- `_wants_verbatim_or_translation()`(verbatim 키워드 또는 번역 키워드)이 참이면 전체 문서 컨텍스트 모드에서 **페이지 수와 무관하게(1페이지여도)** `_translate_pages()`를 탐 — **페이지당 LLM 1회 호출**로 나눠 순서대로 이어붙임 (단일 대형 호출의 출력 한도 초과로 인한 잘림을 구조적으로 방지). 씽킹 모드는 페이지별 호출에서 비활성화(기계적 전사에 사고과정은 출력 예산 낭비). ⚠️ 예전엔 페이지가 정확히 1개일 때만 이 루프를 건너뛰고 검증이 전혀 없는 단일 호출 경로로 빠졌음 — 1페이지 번역 요청(`"11페이지만 번역해줘"`)이 형식 검증 없이 원문 그대로(번역 0%) 반환돼도 "성공"으로 처리되는 버그였음(2026-07-24 수정, `use_page_loop` 조건에서 `len(docs) > 1` → `>= 1`)
+- `_translate_pages()`는 페이지 단위로 격리됨: 하드 실패(Ollama 크래시 등)는 `MAX_PAGE_RETRY_ATTEMPTS`(2)회 재시도 후에도 실패하면 그 페이지만 실패 표시(`failed_pages`)하고 계속 진행 — 완료된 페이지는 절대 유실되지 않음
+- 번역 페이지는 생성 후 구조 검증: `_looks_correctly_interleaved()`(원문/번역 블록 분리 또는 번역 누락 감지), `_looks_duplicated()`(중복 생성 감지 — 인접 블록 반복을 크기 1줄부터 스캔, **한글 줄이 포함된 중복만 플래그** — 번역 불가 OCR 잡음 줄이 원문/번역 자리에 똑같이 복사되는 정상 케이스는 재시도 낭비 없이 통과), `_looks_untranslated_output()`(타깃이 한국어인데 **페이지 전체** 한글 비율 15% 미만이면 오역/미번역으로 간주). 실패 시 교정 메시지와 함께 재시도 — 언어 미번역(`_looks_untranslated_output`) 실패는 다른 형식 문제와 섞이지 않는 전용의 더 강한 재시도 메시지 사용(2026-07-24 추가, 일반 교정 메시지만으로는 재시도 2회 모두 영어로 실패하는 사례가 실측됨)
+- 재시도를 다 소진하고도 형식 검증에 실패한 페이지는 **결과는 유지하되 답변 본문에 인라인으로 경고 표시**(`⚠️ [페이지 X 번역 검증 실패 — ...]`)하고, 별도 `format_issue_pages` 리스트로도 반환됨 — `query_multi_pdf()`의 `truncated` 계산에도 포함됨(`bool(failed_pages) or bool(format_issue_pages) or truncated`). ⚠️ 예전엔 이 경우 `reasoning_steps`에만 경고가 남고 답변 텍스트·`truncated`엔 아무 표시가 없어서, 사용자 입장에선 실패가 성공과 구분되지 않았음(2026-07-24 수정)
+- 번역 지시문(`_line_instructions_for`, 타깃이 한국어일 때)에는 "모든 번역 줄은 반드시 한글로", "마지막 페이지라고 요약/영어 전환 금지", "OCR 잡음 줄은 억지로 영어 해석을 지어내지 말고 원문 그대로 둘 것"을 명시적으로 포함(2026-07-24 추가)
 - 번역 응답에는 `_normalize_korean_counts()` 후처리를 항상 적용 — "12개의 코" → "12코" (모델이 지시문을 따르지 않아도 결정적으로 보정)
 
 ### OCR과 워터마크 제거 (스캔 PDF)
@@ -137,7 +139,7 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 
 ### 질의 시점 OCR 언어 좁히기 (재-OCR)
 - Tesseract 언어팩에 `eng`이 섞이면 CJK 인식률이 실측으로 하락 (예: `下针` → `FH, Get,` 오인식). 그래서 기본값에서 `eng`을 빼는 대신 **질의별로** 좁힘
-- `_detect_ocr_language_override()`: **번역 의도만 있으면** 트리거 — 소스+타깃 언어를 둘 다 명시하면 그 조합("중국어→한국어" → `chi_sim+chi_tra+kor`), 언어명이 0~1개면 CJK 기본값(`_DEFAULT_TRANSLATION_OCR_LANGUAGE = chi_sim+chi_tra+kor`)으로 폴백
+- `_detect_ocr_language_override()`: **번역 의도만 있으면** 트리거 — 소스+타깃 언어를 둘 다 명시하면 그 조합("중국어→한국어" → `chi_sim+chi_tra+kor`), 언어명이 0~1개면 CJK 기본값(`CJK_OCR_LANGUAGE = chi_sim+chi_tra+kor`, `text_extractor.py`)으로 폴백
 - `_reocr_pdf_chunks()`: 원본 파일을 좁힌 언어팩으로 재-OCR (페이지 범위 지정 가능). **결과는 그 질의에만 사용, ChromaDB에는 저장 안 함**. 전체 문서 모드 + `doc_count == page_count`(OCR로 처리된 문서)일 때만
 
 ### 우선참조 컨텍스트 (`data/context/`)
@@ -172,7 +174,7 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 2. **RAG 동작 수정**: `rag_service.py`가 유일한 실경로 (core/rag.py 아님). 프롬프트/지시문 상수도 이 파일 상단에 모여 있음
 3. **프론트 DB 스키마 변경**: `pnpm db:generate` → `pnpm db:migrate` (빈 DB에서도 동작), 빠른 반복은 `pnpm db:push`
 4. **우선참조 컨텍스트 추가**: `data/context/`에 JSON 파일 추가/수정 — 재시작 불필요
-5. **OCR/RAG 변경 검증**: 유닛테스트만으로 불충분 — **반드시 실제 백엔드 + 실제 PDF + 실제 Ollama 모델로 end-to-end 확인** (샘플: `data/pdfs/uploads/pdf_1326292550554632241_대바늘_포포토끼.pdf`). qwen3:14b 생성은 페이지당 수 분 걸리므로 백그라운드로 실행할 것. 테스트 업로드는 검증 후 반드시 삭제 (사용자가 웹 UI를 병행 사용 중)
+5. **OCR/RAG 변경 검증**: 유닛테스트만으로 불충분 — **반드시 실제 백엔드 + 실제 PDF + 실제 Ollama 모델로 end-to-end 확인** (샘플: `pdf_id=pdf_393662820633708541`, `data/pdfs/uploads/pdf_393662820633708541_대바늘_포포토끼.pdf`, 11페이지 — `GET /api/v1/pdfs`로 현재 등록된 pdf_id 재확인 후 사용할 것, 업로드마다 새 ID가 발급되므로 이 값은 바뀔 수 있음). qwen3:14b 생성은 페이지당 수 분 걸리므로 백그라운드로 실행할 것. 테스트 업로드는 검증 후 반드시 삭제 (사용자가 웹 UI를 병행 사용 중)
 
 ## 알려진 제약
 
@@ -191,29 +193,9 @@ RAG 프롬프트에는 청크 **텍스트**만 들어가고 메타데이터는 �
 
 ## 알려진 문제점 및 개선 계획
 
-실제 검증(2026-07-23, 대바늘_포포토끼.pdf)에서 확인된 미해결 이슈와 개선 방향. 우선순위순.
+실제 검증(대바늘_포포토끼.pdf, 11페이지)에서 확인된 미해결 이슈. 해결된 항목은 이 목록에서 제거하고 위 아키텍처 섹션에 현재 동작으로 반영함 — 히스토리가 필요하면 git log 참조.
 
-1. ✅ **(해결됨, 2026-07-23) 마지막 페이지 번역 언어 드리프트** — 11페이지 번역 시 마지막 페이지만 한국어 대신 영어로 출력된 사례.
-   - 조치: `_expects_korean_output()`(번역 의도 + 타깃 언어를 명시적으로 다른 언어로 지정하지 않았으면 True) + `_looks_untranslated_output()`(한글 비율 15% 미만이면 True)을 `_translate_pages()`의 페이지별 형식 검증에 추가 — 형식 오류로 간주해 기존 재시도 루프를 태움. 재시도 프롬프트에도 "요청한 언어로 번역"을 명시적으로 재확인시킴
-2. ✅ **(해결됨, 2026-07-23) 번역 불가 OCR 잡음 줄이 중복 감지 재시도를 낭비** — `V 2061 : 人 2` 같은 잡음 줄은 모델이 원문/번역 자리에 똑같이 복사해 `_looks_duplicated()`에 걸리고, 재시도 2회(페이지당 수 분)를 소모한 뒤에야 결과 유지로 넘어감
-   - 조치: `_looks_duplicated()`가 중복된 블록에 **한글(번역) 줄이 최소 1개 포함된 경우에만** True를 반환하도록 변경 — 잡음 줄만 반복된 경우(번역 대상 자체가 없어 재시도로 못 고치는 경우)는 더 이상 걸리지 않음. 실제 번역 내용이 중복된 진짜 문제(전체 페이지 재생성, 헤더/워터마크+번역 동반 중복)는 여전히 감지됨
-3. ✅ **(해결됨, 2026-07-23) 수량 표기 어색함** — `[12针]`이 `[12코]` 대신 `[12개의 코]`로 출력됨 (용어는 맞지만 "개의"가 불필요)
-   - 조치: `TRANSLATION_LINE_INSTRUCTIONS`에 "숫자와 단위는 붙여서 표기(12코, 12개의 코 금지)" 규칙 추가 + `_normalize_korean_counts()` 결정적 후처리(정규식 `(\d+)\s*개의\s*코` → `\1코`, `query_multi_pdf`에서 번역 응답에 항상 적용)로 이중 안전망. ⚠️ 정규식에 트레일링 `\b`(단어 경계)를 넣으면 안 됨 — 한글 조사(와/를 등)가 코에 공백 없이 붙어 Python의 유니코드 인식 `\b`가 한글-한글 사이를 경계로 보지 않아 매칭이 조용히 실패함
-4. ✅ **(해결됨, 2026-07-23) 박제된 구버전 OCR 임베딩** — OCR 언어 수정 이전에 업로드된 PDF는 ChromaDB에 깨진 텍스트가 남아 있고, 번역 외 일반 질의는 이 텍스트를 그대로 씀
-   - 조치(B안): "재-OCR 결과로 컬렉션 갱신" 기능 추가. `PDFService.refresh_ocr(pdf_id, db, ocr_language=None)` — 원본 파일을 `CJK_OCR_LANGUAGE`(`text_extractor.py`, `chi_sim+chi_tra+kor`)로 재-OCR하고 기존 컬렉션을 삭제 후 **같은 `collection_name`으로 재생성** (`pdf_id`/`collection_name` 불변, `doc_count`/`page_count`만 갱신). `POST /api/v1/pdfs/{pdf_id}/refresh-ocr` 엔드포인트로 노출, 웹 UI 사이드바에 PDF별 새로고침 아이콘(호버 시 노출) 추가. `doc_count != page_count`(원래 OCR 문서가 아님) 또는 원본 파일 없음이면 400, PDF 없음이면 404. `VectorStore.delete_collection_by_name()` 헬퍼 신설(기존 `delete_pdf`의 raw Chroma 생성 코드도 이걸로 정리) — 임의의 컬렉션명을 인스턴스 상태와 무관하게 삭제 가능
-5. 🔶 **(부분 해결, 2026-07-23) 저장소 잔재 정리** — ChromaDB 고아 컬렉션, `api.db`의 미사용 `analysis_results` 테이블, 레거시 `core/rag.py`·`core/llm.py`(+ `tests/test_rag.py`)
-   - ✅ 조치: `scripts/cleanup_orphans.py` 작성 후 `--apply` 실행 완료 — 고아 ChromaDB 컬렉션 3개(`pdf_632425175926842791`·`pdf_973033043484023512` 0청크, `pdf_7679892920309835191` 1청크) 삭제, `analysis_results` 테이블 DROP. 남은 컬렉션은 `pdf_1884475783623626966`(11청크, 실제 사용 중인 PDF) 1개뿐임을 확인. `api.db`엔 아직 `chat_sessions`/`messages`(6번 항목에서 제거된 백엔드 채팅 기록의 물리 잔재) 테이블이 남아있음 — 스크립트는 현재 이 둘을 대상으로 다루지 않음(추가 가능)
-   - ⏸ 레거시 모듈(`core/rag.py`, `core/llm.py`, `tests/test_rag.py`)은 Streamlit 방향성 결정 전까지 보류 — 미해결
-6. ✅ **(해결됨, 2026-07-23) 채팅 기록 이중 저장** — 백엔드 `api.db`와 프론트 `chat.db`에 같은 대화가 따로 저장되어 동기화되지 않음
-   - **조사 결과**: 두 시스템이 같은 역할을 두고 경쟁하는 게 아니었음 — `RAGService.query_multi_pdf()`는 `session_id`를 받지도 않아 세션 히스토리를 답변 생성에 전혀 반영하지 않았고(완전히 무상태·단일턴), 프론트는 `/api/v1/query` 호출 시 항상 `session_id: null`을 보내 백엔드가 **매 질의마다 새 UUID를 생성**(대화 1개 = 세션 여러 개로 쪼개짐, 세션 경계 자체가 깨져 있었음), `GET /sessions/{id}/messages`는 리포지토리 어디서도 호출된 적 없음(문서의 curl 예시가 유일한 참조). 즉 백엔드 쪽은 "제2의 채팅 기록"이 아니라 **아무도 안 읽는 write-only 로그**였음. 반대로 프론트 `chat.db`는 사이드바 히스토리·대화 재개·제목 생성·삭제까지 실제로 동작하는 유일한 진짜 채팅 기록. 두 DB는 같은 커밋(`782a296`, Next.js+FastAPI 동시 도입)에서 조율 없이 각자의 스캐폴딩(Vercel AI Chatbot 템플릿의 Drizzle 저장소 + 새 REST 레이어의 자체 로그)을 그대로 가져오면서 생긴 결과
-   - **조치**: 백엔드의 `ChatSession`/`ChatMessage` 저장 경로를 전부 제거 — `src/api/database.py`(모델 클래스), `src/api/services/rag_service.py`(`save_message()`/`get_session_messages()`), `src/api/routers/query.py`(`GET /sessions/{id}/messages` 엔드포인트, 질의 전후 저장 호출), `src/api/models.py`(`QueryRequest.session_id`, `QueryResponse.session_id`/`message_id`), 프론트 `web-ui/lib/ai/provider.ts`(대응 필드), `docs/api/rest-api.md`. 백엔드는 이제 순수 질의응답 엔진, 프론트 `chat.db`가 유일한 채팅 기록. `api.db`의 물리 `chat_sessions`/`messages` 테이블과 기존 데이터는 `analysis_results`와 같은 성격의 잔재로 남겨둠(제거 안 함) — `scripts/cleanup_orphans.py` 대상에 나중에 포함 가능
-7. ✅ **(해결됨, 2026-07-23) 서버 직접 응답 범위 확장** — 기존엔 페이지 수/페이지 원문만 LLM 우회
-   - 조치: `_wants_page_count()`(기존)와 같은 패턴으로 `_wants_filename()`, `_wants_upload_date()`, `_wants_chunk_count()` 추가. `query_multi_pdf()`의 하드코딩된 단일 if문을 `_METADATA_SHORT_CIRCUITS`(예측 함수·라벨·포맷터 튜플 리스트) 순회 방식으로 리팩터링해 4개 유형을 코드 중복 없이 처리. 실제 API로 4가지 질문(페이지 수/파일명/업로드일/청크 수) 전부 LLM 호출 없이 정확히 응답하는 것을 확인
-8. ✅ **(해결됨, 2026-07-23) `needsDocumentContext()` 키워드 분류기(route.ts)가 조잡** — "this", "explain" 등 광범위한 영어 키워드라 일반 대화도 문서 질문으로 오분류 가능
-   - 조사 결과: 이 함수는 PDF를 **하나도 선택 안 한 상태**에서만 결과가 실제로 동작에 영향을 줌(선택된 PDF가 있으면 항상 RAG로 감) — 즉 "일반 대화인데 PDF 선택하라고 잘못 경고하는지"만 결정하는 안전장치. 원래 문서화된 문제 외에 코드 읽다가 실제 버그 2개를 추가로 발견: (1) `.includes()`가 **부분 문자열** 매칭이라 "file"이 "profile" 안에서도, "text"가 "context"/"textbook" 안에서도 매칭됨. (2) 키워드가 **전부 영어**라 이 앱의 실제 사용자(한국어로 질문, CLAUDE.md 참조)의 질문은 사실상 전혀 못 잡음 — 안전장치가 실질적으로 무효했음
-   - 조치: `web-ui/app/(chat)/api/chat/route.ts`의 `needsDocumentContext()` — 키워드를 "document"/"pdf"/"file"/"page(s)"/"section"/"chapter"/"uploaded"/"attachment(ed)" 등 **명확한 문서 참조어로만** 축소(오탐 방지가 정확도보다 우선 — 여기서 오탐이 정상 대화를 막는 게 미탐보다 UX 비용이 더 큼), 정규식(`\b...\b`) 단어 경계 매칭으로 교체, 한국어 키워드("문서"/"파일"/"페이지"/"업로드"/"첨부"/"도안" 등) 추가. 실제 문서 질문 7개 + 오탐 유발했던 일반 대화 11개(부분 문자열 버그 케이스 포함) 총 18개 케이스로 검증, 전부 예상대로 동작
-9. ✅ **(해결됨, 2026-07-23) pre-commit이 pytest 대신 unittest 실행** — CI(pytest)와 불일치. `.pre-commit-config.yaml`의 entry를 pytest로 교체 검토
-   - 조사 결과: 단순 "다른 러너를 쓴다" 수준이 아니라, 실제로 **87개 테스트 중 9개만 실행**되고 있었음. `python -m unittest discover tests`는 `unittest.TestCase` 서브클래스만 수집하는데, 레거시 `test_rag.py`(9개)만 그 형태이고 `test_ocr_pipeline.py`(이번 세션 OCR/번역/재-OCR 검증 로직 대부분), `test_document.py`, `test_models.py`, `test_pdf_service.py`의 pytest 스타일 함수 테스트 78개는 조용히 전부 스킵됨 — pre-commit이 사실상 회귀 방지 역할을 거의 못 하고 있었음(직접 실행해서 확인: `python -m unittest discover tests -v` → "Ran 9 tests")
-   - 조치: `.pre-commit-config.yaml`의 `python-tests` 훅 entry를 `python -m unittest discover tests` → `python -m pytest tests/`로 교체. CI와 동일한 러너로 통일되어 87개 전체가 실행됨. 직접 `python -m pytest tests/` 실행해 87개 전부 통과 확인(pre-commit CLI 자체는 미설치 환경이라, `language: system` 훅이 그대로 셸에서 실행하는 동일 명령으로 검증)
-10. ✅ **(해결됨, 2026-07-23) API 응답에 기계판독용 `truncated` 플래그 없음** — 현재는 답변 텍스트의 ⚠️ 문구로만 표시. `metadata` dict에 boolean 추가하면 UI가 활용 가능
-    - 조치: `RAGService.query_multi_pdf()`의 반환 타입을 `Tuple[str, List[Dict], List[str]]` → `Tuple[str, List[Dict], List[str], bool]`로 확장. 4번째 값은 `truncated`(Ollama `done_reason`이 끝까지 `"stop"`에 도달 못함) 또는 `failed_pages`(재시도 소진 후에도 실패한 페이지 있음) 중 하나라도 참이면 `True` — 메타데이터/페이지 원문 단축경로는 LLM이 생성한 게 아니라서 항상 `False`. `src/api/routers/query.py`가 이 값을 `QueryResponse.metadata["truncated"]`로 그대로 전달(스키마 변경 없음 — `metadata`는 이미 `Dict[str, Any]`). 실제 API로 응답에 `"truncated": false`가 포함되는 것 확인
+1. 🔶 **저장소 잔재 정리 보류** — (a) `core/rag.py`(`RAGPipeline`), `core/llm.py`(`LLMManager`), `tests/test_rag.py`는 실제 서빙 경로 어디서도 안 쓰임(실 RAG 로직은 `rag_service.py`); Streamlit 앱의 향후 방향(유지/제거)이 결정되기 전까지 삭제 보류. (b) **(2026-07-24 발견)** `data/pdfs/uploads/`에 `api.db`의 `pdfs` 테이블과 매칭되는 레코드가 없는 원본 PDF 파일이 최소 1개 존재(`pdf_1326292550554632241_대바늘_포포토끼.pdf` — 현재 유효한 건 `pdf_393662820633708541_...`뿐) — 이전 세션에서 삭제된 PDF의 원본 파일이 안 지워지고 남은 것으로 보임. `scripts/cleanup_orphans.py`는 현재 ChromaDB 컬렉션만 다루고 `data/pdfs/uploads/` 파일 시스템은 검사하지 않음 — 스크립트 대상에 추가하면 좋을 후보
+2. ⚠️ **(2026-07-24 발견) 번역 형식 검증이 페이지 단위 평균이라 줄 단위 언어 이탈을 못 잡음** — `_looks_untranslated_output()`은 **페이지 전체**의 한글 비율(15% 기준)만 봄. 페이지 대부분이 정상적으로 한국어로 번역되면, 그 안의 일부 줄(특히 워터마크/캡션처럼 짧고 의미상 독립된 문장, 또는 "Long-tail Cast On 69 sts"처럼 특정 기술 용어 줄)이 영어로 새어도 검증을 통과함 — 실측: 핵심 뜨개 지시문(R1~R41)은 한국어로 정상 번역되면서도 저작권 고지/계정 안내 캡션 줄만 반복적으로 영어로 출력됨. 지시문에 "모든 번역 줄은 한글로" 규칙을 추가해도(위 아키텍처 섹션 참조) 이 특정 패턴은 계속 뚫림 — 프롬프트만으로는 한계가 있어 보이고, 근본 해결은 페이지가 아니라 **줄 단위 언어 검증**으로 바꿔야 할 것으로 보임(아직 미구현 — 범위가 커서 보류 중)
+3. ⚠️ **(2026-07-24 발견/확인) qwen3:14b의 반복 생성(중복) 실패가 페이지마다 비결정적으로 발생** — "全下针"처럼 짧고 실제로 여러 번 반복되는 구조적 지시문 페이지에서, 모델이 이미 생성한 블록을 한 번 더 통째로 반복해버리는 자기회귀 반복 루프 현상이 관찰됨(`_looks_duplicated()`가 감지, 재시도 2회로도 못 고치는 경우 있음). **실행마다 실패하는 페이지가 달라짐**(동일 문서, 동일 코드로 3회 연속 전체 번역 시 실패 페이지가 매번 다름) — 코드 버그가 아니라 모델 자체의 샘플링 확률성(기본 temperature)에 기인하는 것으로 보임
+   - ❌ **시도했으나 되돌림**: `repeat_penalty`를 1.1(Ollama 기본)→1.3으로 올려 페이지 루프 호출에 적용해봄 — 해당 실행에서 중복 생성은 0건으로 줄었으나, **더 심각한 새 오류**가 발생함(실측: 정상적으로 반복돼야 할 "코"/"针" 토큰을 모델이 회피하다가 극단적으로 낮은 확률의 토큰을 끌어써서 번역 중간에 **러시아어 단어가 삽입**되고 "[69针织]"처럼 단위 표기가 깨짐). 중복 생성은 이미 `_looks_duplicated()` 재시도 + 실패 시 인라인 경고 표시(위 아키텍처 섹션 참조)로 안전하게(눈에 띄게) 처리되고 있어서, 더 위험한 오류를 감수할 가치가 없다고 판단해 되돌림(`TRANSLATION_REPEAT_PENALTY` 상수/사용 코드 제거, `ChatOllama` 기본값으로 복귀). **다시 시도할 경우 1.3보다 훨씬 보수적인 값(예: 1.15)부터 점진적으로 테스트할 것, 그리고 반드시 전체 문서 라이브 재번역으로 부작용(단위 표기 깨짐·언어 혼입)까지 확인할 것**
