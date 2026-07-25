@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     PROJECT_ROOT: Path = Path(__file__).parent.parent.parent
     PDF_STORAGE_DIR: str = "data/pdfs/uploads"
     VECTOR_DB_DIR: str = "data/vectors"
+    # Priority reference context (*.json) consulted before the model's own
+    # knowledge — glossaries, rule sheets, domain facts, etc. See RAGService.
+    CONTEXT_DIR: str = "data/context"
 
     # Database
     DATABASE_URL: str = "sqlite:///./data/api.db"

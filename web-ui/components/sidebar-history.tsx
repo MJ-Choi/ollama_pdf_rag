@@ -130,8 +130,22 @@ export function SidebarHistory({ user }: { user: User | undefined }) {
 
     setShowDeleteDialog(false);
 
+    // fetch() only rejects on a network-level failure — it resolves normally
+    // for HTTP error statuses (403/404/500), so without this check
+    // toast.promise's success branch would fire (and the chat would vanish
+    // from the local list) even when the server-side delete never happened.
     const deletePromise = fetch(`/api/chat?id=${chatToDelete}`, {
       method: "DELETE",
+    }).then(async (response) => {
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        console.error(
+          `Failed to delete chat ${chatToDelete}: ${response.status} ${response.statusText}`,
+          body
+        );
+        throw new Error(body.message || "Failed to delete chat");
+      }
+      return response;
     });
 
     toast.promise(deletePromise, {
@@ -155,7 +169,7 @@ export function SidebarHistory({ user }: { user: User | undefined }) {
 
         return "Chat deleted successfully";
       },
-      error: "Failed to delete chat",
+      error: (err: Error) => err.message || "Failed to delete chat",
     });
   };
 

@@ -1,6 +1,7 @@
 "use client";
 import type { UseChatHelpers } from "@ai-sdk/react";
 import equal from "fast-deep-equal";
+import { format } from "date-fns";
 import { memo, useState } from "react";
 import type { Vote } from "@/lib/db/schema";
 import type { ChatMessage } from "@/lib/types";
@@ -22,7 +23,7 @@ import { MessageActions } from "./message-actions";
 import { MessageEditor } from "./message-editor";
 import { MessageReasoning } from "./message-reasoning";
 import { PreviewAttachment } from "./preview-attachment";
-import { Weather } from "./weather";
+import { SourcesPanel } from "./sources-panel";
 
 const PurePreviewMessage = ({
   chatId,
@@ -116,23 +117,44 @@ const PurePreviewMessage = ({
               );
             }
 
+            if (type === "data-sources") {
+              return <SourcesPanel key={key} sources={part.data} />;
+            }
+
             if (type === "text") {
               if (mode === "view") {
+                const timestamp = message.metadata?.createdAt;
+                const timeLabel = timestamp && (
+                  <span className="shrink-0 text-muted-foreground text-xs">
+                    {format(new Date(timestamp), "HH:mm")}
+                  </span>
+                );
+
+                // User bubble: timestamp to its left, whole row pinned to
+                // the right edge. Assistant response: timestamp below the
+                // text instead — an inline leading timestamp reads oddly
+                // once the response wraps to multiple lines/paragraphs.
+                if (message.role === "assistant") {
+                  return (
+                    <div className="flex flex-col gap-1" key={key}>
+                      <MessageContent
+                        className="bg-transparent px-0 py-0 text-left"
+                        data-testid="message-content"
+                      >
+                        <Response>{sanitizeText(part.text)}</Response>
+                      </MessageContent>
+                      {timeLabel}
+                    </div>
+                  );
+                }
+
                 return (
-                  <div key={key}>
+                  <div className="flex items-end justify-end gap-2" key={key}>
+                    {timeLabel}
                     <MessageContent
-                      className={cn({
-                        "w-fit break-words rounded-2xl px-3 py-2 text-right text-white":
-                          message.role === "user",
-                        "bg-transparent px-0 py-0 text-left":
-                          message.role === "assistant",
-                      })}
+                      className="w-fit break-words rounded-2xl px-3 py-2 text-right text-white"
                       data-testid="message-content"
-                      style={
-                        message.role === "user"
-                          ? { backgroundColor: "#006cff" }
-                          : undefined
-                      }
+                      style={{ backgroundColor: "#006cff" }}
                     >
                       <Response>{sanitizeText(part.text)}</Response>
                     </MessageContent>
@@ -159,27 +181,6 @@ const PurePreviewMessage = ({
                   </div>
                 );
               }
-            }
-
-            if (type === "tool-getWeather") {
-              const { toolCallId, state } = part;
-
-              return (
-                <Tool defaultOpen={true} key={toolCallId}>
-                  <ToolHeader state={state} type="tool-getWeather" />
-                  <ToolContent>
-                    {state === "input-available" && (
-                      <ToolInput input={part.input} />
-                    )}
-                    {state === "output-available" && (
-                      <ToolOutput
-                        errorText={undefined}
-                        output={<Weather weatherAtLocation={part.output} />}
-                      />
-                    )}
-                  </ToolContent>
-                </Tool>
-              );
             }
 
             if (type === "tool-createDocument") {

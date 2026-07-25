@@ -1,8 +1,8 @@
 # Chat Interface Guide
 
-Ollama PDF RAG offers two user interfaces: a modern Next.js app and a classic Streamlit interface. This guide covers both.
+Ollama PDF RAG's chat interface is a Next.js app.
 
-## Next.js Interface (Recommended)
+## Next.js Interface
 
 The Next.js interface at `http://localhost:3000` provides the full-featured experience.
 
@@ -177,91 +177,12 @@ Responses stream word-by-word with:
 
 ---
 
-## Streamlit Interface (Classic)
-
-The Streamlit interface at `http://localhost:8501` provides a simpler experience.
-
-![Streamlit Interface](../assets/st_app_ui.png)
-
-### Layout
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Ollama PDF RAG                                         │
-├───────────────┬─────────────────────────────────────────┤
-│               │                                         │
-│  📄 Upload    │              PDF Preview                │
-│  [Browse]     │         ┌──────────────────┐           │
-│               │         │                  │           │
-│  🤖 Model     │         │   Page 1 of 10   │           │
-│  [llama3.2 ▼] │         │                  │           │
-│               │         └──────────────────┘           │
-│  🔍 Zoom      │                                         │
-│  [────●────]  │                                         │
-│               ├─────────────────────────────────────────│
-│  ❌ Delete    │                                         │
-│               │              Chat Area                  │
-│               │                                         │
-│               │  User: What is this document about?    │
-│               │                                         │
-│               │  Assistant: This document covers...    │
-│               │                                         │
-│               │  [Type your question here...]          │
-│               │                                         │
-└───────────────┴─────────────────────────────────────────┘
-```
-
-### Features
-
-| Feature | Description |
-|---------|-------------|
-| File Upload | Drag & drop or browse |
-| Sample PDF | Quick start with included samples |
-| Model Selection | Dropdown of available models |
-| PDF Viewer | Preview with zoom control |
-| Chat History | In-session message history |
-| Delete Collection | Clear vector database |
-
-### Usage
-
-1. **Upload PDF** - Use sidebar uploader or sample
-2. **Select Model** - Choose from dropdown
-3. **Adjust Zoom** - Slider for PDF visibility
-4. **Ask Questions** - Type in chat input
-5. **Clear Context** - Delete Collection when switching PDFs
-
----
-
-## Comparison
-
-| Feature | Next.js | Streamlit |
-|---------|---------|-----------|
-| Modern UI | ✅ | ❌ |
-| Chat persistence | ✅ | ❌ |
-| Multi-PDF selection | ✅ | ❌ |
-| Question classification | ✅ | ❌ |
-| PDF preview | ❌ | ✅ |
-| Response streaming | ✅ | ✅ |
-| Mobile friendly | ✅ | ⚠️ |
-| Setup complexity | Medium | Low |
-
----
-
 ## Keyboard Shortcuts
-
-### Next.js
 
 | Shortcut | Action |
 |----------|--------|
 | `Enter` | Send message |
 | `Shift + Enter` | New line in message |
-
-### Streamlit
-
-| Shortcut | Action |
-|----------|--------|
-| `Enter` | Send message |
-| `Ctrl + K` | Clear chat |
 
 ---
 

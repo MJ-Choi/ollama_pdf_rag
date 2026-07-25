@@ -20,9 +20,11 @@ import {
   SidebarMenuItem,
   SidebarMenuButton,
 } from "@/components/ui/sidebar";
-import { FileText, Trash2, Square, CheckSquare } from "lucide-react";
+import { FileText, Trash2, Square, CheckSquare, RefreshCw, Eye } from "lucide-react";
 import { fetcher } from "@/lib/utils";
 import { usePDFSelection } from "@/hooks/use-pdf-selection";
+import { usePdfViewer } from "@/hooks/use-pdf-viewer";
+import { PDFUpload } from "./pdf-upload";
 import { Button } from "./ui/button";
 
 interface PDF {
@@ -46,9 +48,11 @@ export function SidebarPDFs() {
 
   // Use global PDF selection state (persists across chats)
   const { selectedPdfIds, togglePdf, selectAll, clearSelection, isSelected } = usePDFSelection();
+  const { openPdf } = usePdfViewer();
 
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [refreshingId, setRefreshingId] = useState<string | null>(null);
 
   // Clean up selected PDFs that no longer exist
   useEffect(() => {
@@ -88,6 +92,45 @@ export function SidebarPDFs() {
     });
   };
 
+  // Re-runs OCR against the PDF's original file and replaces its stored
+  // ChromaDB collection — for PDFs uploaded before an OCR quality/language
+  // fix, whose embedded text is otherwise stale forever.
+  const handleRefreshOcr = async (pdfId: string) => {
+    setRefreshingId(pdfId);
+
+    const refreshPromise = fetch(
+      `http://localhost:8001/api/v1/pdfs/${pdfId}/refresh-ocr`,
+      { method: "POST" }
+    ).then(async (res) => {
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "Failed to refresh OCR");
+      }
+      return res.json();
+    });
+
+    toast.promise(refreshPromise, {
+      loading: "Re-running OCR...",
+      success: (updated) => {
+        mutate(
+          (currentPDFs) =>
+            currentPDFs?.map((pdf) =>
+              pdf.pdf_id === pdfId ? { ...pdf, ...updated } : pdf
+            ),
+          false
+        );
+        return "OCR refreshed successfully";
+      },
+      error: (err) => err.message || "Failed to refresh OCR",
+    });
+
+    try {
+      await refreshPromise;
+    } finally {
+      setRefreshingId(null);
+    }
+  };
+
   if (isLoading) {
     return (
       <SidebarGroup>
@@ -119,7 +162,9 @@ export function SidebarPDFs() {
         <SidebarGroupContent>
           <div className="flex w-full flex-col items-center justify-center gap-2 px-2 py-4 text-sm text-zinc-500">
             <span>No PDFs uploaded yet.</span>
-            <span className="text-xs">Use the 📎 button to upload.</span>
+          </div>
+          <div className="px-2 pb-2">
+            <PDFUpload onUploadComplete={() => mutate()} />
           </div>
         </SidebarGroupContent>
       </SidebarGroup>
@@ -159,6 +204,9 @@ export function SidebarPDFs() {
             ⚠️ Select PDFs to use as context
           </div>
         )}
+        <div className="px-2 pb-2">
+          <PDFUpload onUploadComplete={() => mutate()} />
+        </div>
         <SidebarGroupContent>
           <SidebarMenu>
             {pdfs.map((pdf) => {
@@ -187,6 +235,50 @@ export function SidebarPDFs() {
                         </div>
                       </div>
                     </SidebarMenuButton>
+                    <div
+                      className="ml-2 cursor-pointer opacity-0 transition-opacity group-hover/pdf:opacity-100"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openPdf(pdf.pdf_id, pdf.name, 1);
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      title="View PDF pages"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          openPdf(pdf.pdf_id, pdf.name, 1);
+                        }
+                      }}
+                    >
+                      <Eye className="h-4 w-4 text-zinc-500 hover:text-primary" />
+                    </div>
+                    <div
+                      className="ml-2 cursor-pointer opacity-0 transition-opacity group-hover/pdf:opacity-100"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (refreshingId !== pdf.pdf_id) {
+                          handleRefreshOcr(pdf.pdf_id);
+                        }
+                      }}
+                      role="button"
+                      tabIndex={0}
+                      title="Re-run OCR and refresh embeddings"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          if (refreshingId !== pdf.pdf_id) {
+                            handleRefreshOcr(pdf.pdf_id);
+                          }
+                        }
+                      }}
+                    >
+                      <RefreshCw
+                        className={`h-4 w-4 text-zinc-500 hover:text-primary ${
+                          refreshingId === pdf.pdf_id ? "animate-spin" : ""
+                        }`}
+                      />
+                    </div>
                     <div
                       className="ml-2 mr-2 cursor-pointer opacity-0 transition-opacity group-hover/pdf:opacity-100"
                       onClick={(e) => {

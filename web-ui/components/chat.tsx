@@ -2,6 +2,7 @@
 
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
+import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import useSWR, { useSWRConfig } from "swr";
@@ -30,6 +31,15 @@ import { useDataStream } from "./data-stream-provider";
 import { Messages } from "./messages";
 import { MultimodalInput } from "./multimodal-input";
 import { getChatHistoryPaginationKey } from "./sidebar-history";
+
+// pdfjs-dist touches browser-only globals (DOMMatrix) at module-evaluation
+// time, which crashes Next.js's SSR pass for any component that imports it
+// statically — ssr: false keeps it out of the server bundle entirely, only
+// ever loading in the browser.
+const PdfViewerPanel = dynamic(
+  () => import("./pdf-viewer-panel").then((mod) => mod.PdfViewerPanel),
+  { ssr: false }
+);
 import { toast } from "./toast";
 import type { VisibilityType } from "./visibility-selector";
 
@@ -147,6 +157,7 @@ export function Chat({
     if (query && !hasAppendedQuery) {
       sendMessage({
         role: "user" as const,
+        metadata: { createdAt: new Date().toISOString() },
         parts: [{ type: "text", text: query }],
       });
 
@@ -211,6 +222,8 @@ export function Chat({
           )}
         </div>
       </div>
+
+      <PdfViewerPanel />
 
       <Artifact
         attachments={attachments}

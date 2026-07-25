@@ -39,14 +39,32 @@ Each uploaded PDF gets a unique ID based on filename + timestamp hash.
 
 ## Step 2: Document Loading
 
-We use LangChain's `UnstructuredPDFLoader` to extract text:
+We first try LangChain's `UnstructuredPDFLoader` to extract native text:
 
 ```python
 from langchain_community.document_loaders import UnstructuredPDFLoader
 
-loader = UnstructuredPDFLoader(file_path)
+loader = UnstructuredPDFLoader(file_path, strategy="fast")
 documents = loader.load()
 ```
+
+### Scanned/Image-Based PDF Fallback (OCR)
+
+If the extracted text is too short, or looks garbled (broken CJK characters,
+mostly single-character "words" — a sign the PDF is actually a scanned
+image), the app automatically falls back to OCR instead of returning junk
+text. This is fully automatic — no external tool or manual pre-processing
+needed:
+
+1. Each page is rasterized to an image (`pdf2image`, 300 DPI)
+2. Each page image is sent to a local vision-LLM, `deepseek-ocr:3b`, running
+   through Ollama — no OCR language configuration needed, the model reads
+   whatever script is on the page
+3. The model's raw output is cleaned up (stray markdown formatting and any
+   embedded image data are stripped) and a repeated watermark/caption line
+   (if one appears on most pages) is detected and removed
+4. Each OCR'd page becomes its own chunk (see `source_page` in the metadata
+   below), instead of being re-split by character count
 
 ### What Gets Extracted
 
@@ -56,8 +74,8 @@ documents = loader.load()
 | Headers/titles | ✅ |
 | Lists | ✅ |
 | Tables (basic) | ✅ |
-| Images | ❌ |
-| Scanned text | ❌ (needs OCR) |
+| Scanned/image-based text | ✅ (automatic OCR fallback, see above) |
+| Text embedded in photos on a page | ✅ (vision-LLM reads it directly) |
 
 ### Document Object
 
@@ -313,8 +331,8 @@ For a typical document:
 ### "Failed to load PDF"
 
 - Check file is valid PDF (not corrupted)
-- Ensure file is text-based (not scanned image)
 - Verify file permissions
+- If the OCR fallback triggered, confirm `ollama pull deepseek-ocr:3b` completed (see below)
 
 ### "No chunks created"
 
@@ -338,14 +356,13 @@ For a typical document:
 
 ### Optimal PDF Characteristics
 
-- ✅ Text-based (not scanned)
 - ✅ Well-structured (headings, paragraphs)
 - ✅ Under 100 pages (for speed)
 - ✅ Clear language (not heavily formatted)
+- ℹ️ Scanned/image-based PDFs work too (automatic OCR fallback) — native-text PDFs just skip the OCR step and process faster
 
 ### Pre-processing Tips
 
 1. **Split large PDFs** - Break into chapters/sections
-2. **OCR scanned docs** - Use Adobe/external tool first
-3. **Remove images** - If not needed for context
-4. **Clean formatting** - Remove excessive headers/footers
+2. **Remove images** - If not needed for context
+3. **Clean formatting** - Remove excessive headers/footers

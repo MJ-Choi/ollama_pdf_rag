@@ -2,6 +2,30 @@
 
 All notable changes to Ollama PDF RAG are documented here.
 
+## [v3.1.0] - 2026-07-25
+
+### 🚀 Major Features
+
+#### Scanned/Image-Based PDF Support
+- **Automatic OCR Fallback** - Scanned/image-based PDFs are detected automatically and OCR'd via a local vision-LLM (`deepseek-ocr:3b` through Ollama) — no manual pre-processing or external OCR tool needed
+- **Watermark & Artifact Removal** - Recurring watermark/caption lines and vision-LLM formatting artifacts (markdown, embedded image data) are stripped before chunking
+- **Query-Time Re-OCR & Collection Refresh** - Re-run OCR against a PDF's original file on demand, either scoped to a single query or to permanently refresh a PDF's stored embeddings
+
+#### Full-Document & Page-Range Translation
+- **Page-by-Page Generation** - Long documents are translated one page at a time with automatic retry/continuation, so responses don't silently cut off partway through
+- **Page-Range Queries** - Ask about or translate just a page range (e.g. "translate pages 1-2") instead of the whole document
+- **Structural Validation** - Each translated page is checked for duplicated content, untranslated/wrong-language output, and correct original/translation interleaving, with bounded automatic retries; unresolved issues are marked inline in the answer rather than silently returned as-is
+- **Priority Reference Context** - Drop glossaries or domain facts as JSON into `data/context/` and the model consults them before its own knowledge
+- **Machine-Readable Truncation Flag** - API responses include a `truncated` boolean so a client can detect an incomplete answer without parsing warning text
+
+#### Server-Side Answer Shortcuts
+- Questions the system already knows the answer to (page count, filename, upload date, chunk count, or a page's raw content) are answered directly from stored metadata — no LLM call needed
+
+### 🔧 Infrastructure
+- Backend session storage (`ChatSession`/`ChatMessage`) removed — the frontend's own chat database is the sole source of chat history
+- `scripts/cleanup_orphans.py` for orphaned ChromaDB collections and unused DB tables
+- pre-commit now runs the full pytest suite (previously only ran a small `unittest`-discoverable subset)
+
 ## [v3.0.0] - 2025-12-19
 
 ### 🚀 Major Features
@@ -91,6 +115,7 @@ All notable changes to Ollama PDF RAG are documented here.
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| v3.1.0 | 2026-07-25 | Scanned-PDF OCR (deepseek-ocr:3b), page-range/full-document translation |
 | v3.0.0 | 2025-12-19 | Next.js UI, FastAPI, Enhanced RAG |
 | v2.1.0 | 2024-01-07 | Test suite, CI/CD, restructuring |
 | v2.0 | 2023-11-05 | Improved RAG, enhanced processing |
@@ -151,8 +176,7 @@ The FastAPI backend uses:
 
 ### Upcoming Features
 
-- [ ] Image extraction from PDFs
-- [ ] OCR support for scanned documents  
+- [x] OCR support for scanned documents (v3.1.0)
 - [ ] Multi-user authentication
 - [ ] Document comparison mode
 - [ ] Export chat history

@@ -7,7 +7,7 @@ dist/
 build/
 
 # Virtual Environment
-.env
+.env*
 .venv/
 venv/
 ENV/
@@ -23,6 +23,7 @@ ENV/
 data/vectors/
 data/*.db
 web-ui/data/*.db
+web-ui/lib/
 *.log
 .cache
 .pytest_cache/

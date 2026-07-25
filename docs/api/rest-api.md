@@ -21,7 +21,6 @@ FastAPI provides automatic interactive API docs:
 | POST | `/api/v1/pdfs/upload` | Upload a PDF |
 | DELETE | `/api/v1/pdfs/{pdf_id}` | Delete a PDF |
 | POST | `/api/v1/query` | RAG query |
-| GET | `/api/v1/sessions/{session_id}/messages` | Get chat history |
 
 ---
 
@@ -194,8 +193,7 @@ Query documents using RAG.
 {
   "question": "What are the security requirements?",
   "model": "qwen3:8b",
-  "pdf_ids": ["pdf_123", "pdf_456"],
-  "session_id": "optional-session-id"
+  "pdf_ids": ["pdf_123", "pdf_456"]
 }
 ```
 
@@ -204,7 +202,6 @@ Query documents using RAG.
 | question | string | Yes | User's question |
 | model | string | Yes | Ollama model name |
 | pdf_ids | array | No | PDFs to search (null = all) |
-| session_id | string | No | Chat session ID |
 
 **Response:**
 
@@ -241,9 +238,7 @@ Query documents using RAG.
       "🧠 Using thinking-enabled model for deeper reasoning...",
       "✨ Answer generated successfully!"
     ]
-  },
-  "session_id": "e4b444b3-7adb-4da3-aefb-e2b745c7719c",
-  "message_id": 42
+  }
 }
 ```
 
@@ -252,8 +247,6 @@ Query documents using RAG.
 | answer | string | Generated response |
 | sources | array | Source chunks used |
 | metadata | object | Processing details |
-| session_id | string | Chat session ID |
-| message_id | integer | Database message ID |
 
 **Errors:**
 
@@ -261,43 +254,6 @@ Query documents using RAG.
 |--------|-------------|
 | 404 | Model not found |
 | 500 | Query failed |
-
----
-
-## Chat History
-
-### `GET /api/v1/sessions/{session_id}/messages`
-
-Get chat history for a session.
-
-**Request:**
-
-```bash
-curl "http://localhost:8001/api/v1/sessions/e4b444b3-7adb/messages"
-```
-
-**Response:**
-
-```json
-[
-  {
-    "message_id": 41,
-    "role": "user",
-    "content": "What are the security requirements?",
-    "sources": null,
-    "timestamp": "2024-12-19T18:30:00Z"
-  },
-  {
-    "message_id": 42,
-    "role": "assistant",
-    "content": "Based on the documents...",
-    "sources": [
-      {"pdf_name": "Security_Guide.pdf", "chunk_index": 3}
-    ],
-    "timestamp": "2024-12-19T18:30:15Z"
-  }
-]
-```
 
 ---
 

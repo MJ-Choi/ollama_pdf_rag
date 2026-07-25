@@ -94,7 +94,28 @@ export function getTrailingMessageId({
 }
 
 export function sanitizeText(text: string) {
-  return text.replace('<has_function_call>', '');
+  return (
+    text
+      .replace('<has_function_call>', '')
+      // Strip leading spaces from every line before markdown rendering.
+      // CommonMark treats 4+ leading spaces as an indented code block —
+      // meaningless in this app's line-by-line OCR/translation output,
+      // where such spacing is just an OCR/formatting artifact — and mixing
+      // a code block into what the surrounding markdown treats as a single
+      // paragraph (via remark-breaks) produced invalid HTML (a <div> block
+      // nested inside a <p>), causing a hydration error.
+      .replace(/^[ \t]+/gm, '')
+      // Escape stray backticks. A single backtick opens a markdown inline
+      // code span that runs until the NEXT backtick anywhere in the text —
+      // with remark-breaks keeping everything in one paragraph, an OCR
+      // artifact backtick several lines away from an unrelated one can
+      // wrap a huge multi-line stretch as "code", which Streamdown then
+      // promotes to a block-level element — the same invalid <div>-in-<p>
+      // nesting as the indented-code-block case above. This content is
+      // OCR/translation output, never intentional markdown, so backticks
+      // are always literal here.
+      .replace(/`/g, '\\`')
+  );
 }
 
 export function convertToUIMessages(messages: DBMessage[]): ChatMessage[] {

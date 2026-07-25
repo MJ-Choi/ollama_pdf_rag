@@ -38,9 +38,10 @@ def test_load_pdf_file_not_found(mock_load):
                     reason="Sample PDF not found")
 def test_load_pdf_success(processor, test_pdf_path):
     """Test loading existing PDF."""
-    documents = processor.load_pdf(test_pdf_path)
+    documents, used_ocr = processor.load_pdf(test_pdf_path)
     assert len(documents) > 0
     assert hasattr(documents[0], 'page_content')
+    assert used_ocr is False
 
 def test_split_documents(processor):
     """Test document splitting."""
