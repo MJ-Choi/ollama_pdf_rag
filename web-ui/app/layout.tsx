@@ -1,5 +1,12 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+// next/font/google fetches font files from fonts.gstatic.com at build/dev
+// time — fails hard with no fallback when that's unreachable (observed:
+// "Module not found: Can't resolve
+// '@vercel/turbopack-next/internal/font/google/font'"). The `geist` package
+// (already a dependency) bundles the same font as local files via
+// next/font/local, so this needs no network access at all.
+import { GeistSans } from "geist/font/sans";
+import { GeistMono } from "geist/font/mono";
 import { Toaster } from "sonner";
 import { ThemeProvider } from "@/components/theme-provider";
 import { PDFSelectionProvider } from "@/hooks/use-pdf-selection";
@@ -16,18 +23,6 @@ export const metadata: Metadata = {
 export const viewport = {
   maximumScale: 1, // Disable auto-zoom on mobile Safari
 };
-
-const geist = Geist({
-  subsets: ["latin"],
-  display: "swap",
-  variable: "--font-geist",
-});
-
-const geistMono = Geist_Mono({
-  subsets: ["latin"],
-  display: "swap",
-  variable: "--font-geist-mono",
-});
 
 const LIGHT_THEME_COLOR = "hsl(0 0% 100%)";
 const DARK_THEME_COLOR = "hsl(240deg 10% 3.92%)";
@@ -56,7 +51,7 @@ export default function RootLayout({
 }>) {
   return (
     <html
-      className={`${geist.variable} ${geistMono.variable}`}
+      className={`${GeistSans.variable} ${GeistMono.variable}`}
       // `next-themes` injects an extra classname to the body element to avoid
       // visual flicker before hydration. Hence the `suppressHydrationWarning`
       // prop is necessary to avoid the React hydration mismatch warning.

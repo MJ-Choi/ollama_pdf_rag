@@ -14,9 +14,9 @@ This fork adds a full OCR and translation pipeline on top of that foundation, bu
 
 - 🖼️ **Scanned PDF OCR** — Automatic detection of image-based/scanned PDFs, with OCR fallback via a local vision-LLM (`deepseek-ocr:3b` through Ollama) when native text extraction fails or is unreliable — no OCR system dependency (tesseract) to install, and no language pack to configure, since the model reads whatever script is on the page
 - 🧹 **Watermark & Artifact Removal** — Recurring text-caption removal (a watermark/caption line repeated across most pages is detected via fuzzy clustering and stripped) plus cleanup of the vision-LLM's own formatting artifacts (stray markdown headers/bold markers, and occasional embedded base64 image data on photo-heavy pages)
-- 🌐 **Full-Document & Page-Range Translation** — Ask to translate a whole scanned document, or just a page range (e.g. "translate pages 1-2 into Korean"), and get a complete, line-by-line, original-then-translation response:
+- 🌐 **Full-Document & Page-Range Translation** — Ask to translate a whole scanned document, or just a page range (e.g. "translate pages 1-2 into Korean"), and get a response structured as a `# 원문:` (original) block followed by a `# 결과:` (result) block, line order preserved between the two:
   - Page-by-page generation loop with automatic retry/continuation, so long documents don't silently cut off partway through
-  - Structural validation after generation — catches original/translation block-separation, duplicated content, and target-language drift (e.g. a page coming back in the wrong language) — with bounded automatic retries
+  - Structural validation after generation — catches a missing/malformed original-then-result section split, duplicated content, and target-language drift (e.g. a page coming back in the wrong language) — with bounded automatic retries
   - Deterministic post-processing for natural unit/counter notation in the target language (e.g. removing an unnecessary counter word after a number)
 - ⚡ **Server-Side Answer Shortcuts** — Questions the system already knows the answer to (page count, filename, upload date, chunk count, or a specific page's raw content) are answered directly from stored metadata — no LLM call, instant and always correct
 - 📚 **Priority Reference Context** — Drop glossaries, rules, or domain facts as JSON into `data/context/` and the model consults them before its own knowledge (e.g. a domain-specific term glossary)
@@ -121,6 +121,7 @@ Or use the convenience script:
 ```
 
 **Service URLs:**
+
 | Service | URL | Description |
 |---------|-----|-------------|
 | Next.js Frontend | http://localhost:3000 | Modern chat interface |

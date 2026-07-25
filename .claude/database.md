@@ -79,6 +79,8 @@ result = col.get(include=['documents', 'metadatas'])
 
 `doc_count == page_count`이면 OCR로 처리된 문서(페이지 단위 청크)라는 뜻 — 재-OCR/새로고침 관련 로직이 이 값으로 원본 판별에 사용(`_reocr_pdf_chunks()`, `refresh_ocr()`).
 
+⚠️ **(2026-07-25 발견, 의도적으로 미해결) 소유자 컬럼이 아예 없음 — PDF 라이브러리는 전 사용자 공유 상태.** 프론트(`web-ui`) 쪽 `chat`/`message`/`vote`/`document`는 실제 로그인 계정(게스트 아닌 회원가입 계정 2개로 직접 검증)으로도 소유권 검증이 정확히 동작하는데, PDF는 `PDFMetadata`에 `user_id`가 없고 `web-ui/components/sidebar-pdfs.tsx`가 NextAuth 세션을 거치지 않고 브라우저에서 `http://localhost:8001/api/v1/pdfs*`를 직접 호출하므로, 로그인 여부·계정과 무관하게 **누구든 모든 PDF를 보고 삭제·재-OCR 가능**(쿠키 없는 curl로도 그대로 조회됨). 고치려면 이 테이블에 `user_id` 컬럼 추가+마이그레이션, PDF 관련 프론트 호출을 Next.js API 라우트 경유로 변경(서버측에서만 신뢰 가능한 로그인 사용자 id 전달), 기존 업로드분의 소유자 결정이 필요 — 범위가 커서 사용자 판단으로 이번엔 구현하지 않고 현황만 기록(`.claude/CLAUDE.md`의 "알려진 문제점 및 개선 계획" 5번 항목 참조).
+
 ### 잔재 테이블 (코드에서 미사용, DB 파일에만 남아있음)
 
 ⚠️ 아래 테이블은 `src/api/database.py`에 SQLAlchemy 모델이 없고, 현재 코드 어디에서도 읽거나 쓰지 않는다. 물리적으로 `api.db` 안에 남아있을 뿐이다.
